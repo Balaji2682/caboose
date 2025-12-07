@@ -1,0 +1,1855 @@
+use crate::context::RequestContextTracker;
+use crate::database::DatabaseHealth;
+use crate::exception::ExceptionTracker;
+use crate::git::GitInfo;
+use crate::parser::{LogEvent, RailsLogParser};
+use crate::process::{LogLine, ProcessInfo, ProcessStatus};
+use crate::stats::StatsCollector;
+use crate::test::TestTracker;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
+    Frame, Terminal,
+};
+use std::io;
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ViewMode {
+    Logs,
+    QueryAnalysis,
+    RequestDetail(usize), // Index of selected request
+    DatabaseHealth,
+    TestResults,
+    Exceptions,
+}
+
+pub struct App {
+    processes: Vec<ProcessInfo>,
+    logs: Vec<LogLine>,
+    max_logs: usize,
+    should_quit: bool,
+    git_info: GitInfo,
+    stats_collector: StatsCollector,
+    context_tracker: std::sync::Arc<RequestContextTracker>,
+    db_health: std::sync::Arc<DatabaseHealth>,
+    test_tracker: std::sync::Arc<TestTracker>,
+    exception_tracker: std::sync::Arc<ExceptionTracker>,
+    view_mode: ViewMode,
+    // Search and navigation
+    search_mode: bool,
+    search_query: String,
+    log_scroll: usize,
+    request_scroll: usize,
+    selected_request: usize,
+    selected_exception: usize,
+    // Filtering
+    filter_process: Option<String>,
+}
+
+impl App {
+    pub fn new(
+        git_info: GitInfo,
+        stats_collector: StatsCollector,
+        context_tracker: std::sync::Arc<RequestContextTracker>,
+        db_health: std::sync::Arc<DatabaseHealth>,
+        test_tracker: std::sync::Arc<TestTracker>,
+        exception_tracker: std::sync::Arc<ExceptionTracker>,
+    ) -> Self {
+        Self {
+            processes: Vec::new(),
+            logs: Vec::new(),
+            max_logs: 1000,
+            should_quit: false,
+            git_info,
+            stats_collector,
+            context_tracker,
+            db_health,
+            test_tracker,
+            exception_tracker,
+            view_mode: ViewMode::Logs,
+            search_mode: false,
+            search_query: String::new(),
+            log_scroll: 0,
+            request_scroll: 0,
+            selected_request: 0,
+            selected_exception: 0,
+            filter_process: None,
+        }
+    }
+
+    pub fn add_log(&mut self, log: LogLine) {
+        // Parse log for stats and context tracking
+        if let Some(event) = RailsLogParser::parse_line(&log.content) {
+            match &event {
+                LogEvent::HttpRequest(req) => {
+                    if let (Some(status), Some(duration)) = (req.status, req.duration) {
+                        self.stats_collector.record_request(status, duration);
+                    }
+                }
+                LogEvent::SqlQuery(query) => {
+                    if let Some(duration) = query.duration {
+                        self.stats_collector.record_sql_query(duration);
+                        // Feed to database health tracker
+                        self.db_health.analyze_query(&query.query, duration);
+                    }
+                }
+                _ => {}
+            }
+
+            // Feed to context tracker
+            self.context_tracker.process_log_event(&event);
+        }
+
+        // Feed to test tracker
+        self.test_tracker.parse_line(&log.content);
+
+        // Feed to exception tracker
+        self.exception_tracker.parse_line(&log.content);
+
+        self.logs.push(log);
+        if self.logs.len() > self.max_logs {
+            self.logs.remove(0);
+        }
+    }
+
+    pub fn toggle_view(&mut self) {
+        self.view_mode = match self.view_mode {
+            ViewMode::Logs => ViewMode::QueryAnalysis,
+            ViewMode::QueryAnalysis => ViewMode::DatabaseHealth,
+            ViewMode::DatabaseHealth => ViewMode::TestResults,
+            ViewMode::TestResults => ViewMode::Exceptions,
+            ViewMode::Exceptions => ViewMode::Logs,
+            ViewMode::RequestDetail(_) => ViewMode::QueryAnalysis,
+        };
+    }
+
+    pub fn select_next_exception(&mut self) {
+        let total = self.exception_tracker.get_grouped_exceptions().len();
+        if total > 0 {
+            self.selected_exception = (self.selected_exception + 1).min(total - 1);
+        }
+    }
+
+    pub fn select_previous_exception(&mut self) {
+        if self.selected_exception > 0 {
+            self.selected_exception -= 1;
+        }
+    }
+
+    pub fn enter_search_mode(&mut self) {
+        self.search_mode = true;
+        self.search_query.clear();
+    }
+
+    pub fn exit_search_mode(&mut self) {
+        self.search_mode = false;
+        self.search_query.clear();
+    }
+
+    pub fn add_search_char(&mut self, c: char) {
+        self.search_query.push(c);
+    }
+
+    pub fn remove_search_char(&mut self) {
+        self.search_query.pop();
+    }
+
+    pub fn scroll_up(&mut self) {
+        if self.log_scroll > 0 {
+            self.log_scroll -= 1;
+        }
+    }
+
+    pub fn scroll_down(&mut self) {
+        self.log_scroll += 1;
+    }
+
+    pub fn scroll_page_up(&mut self, page_size: usize) {
+        self.log_scroll = self.log_scroll.saturating_sub(page_size);
+    }
+
+    pub fn scroll_page_down(&mut self, page_size: usize) {
+        self.log_scroll += page_size;
+    }
+
+    pub fn select_next_request(&mut self) {
+        let total = self.context_tracker.get_recent_requests().len();
+        if total > 0 {
+            self.selected_request = (self.selected_request + 1).min(total - 1);
+        }
+    }
+
+    pub fn select_previous_request(&mut self) {
+        if self.selected_request > 0 {
+            self.selected_request -= 1;
+        }
+    }
+
+    pub fn view_selected_request(&mut self) {
+        self.view_mode = ViewMode::RequestDetail(self.selected_request);
+    }
+
+    pub fn toggle_filter_process(&mut self, process: String) {
+        if let Some(current) = &self.filter_process {
+            if current == &process {
+                self.filter_process = None;
+            } else {
+                self.filter_process = Some(process);
+            }
+        } else {
+            self.filter_process = Some(process);
+        }
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.filter_process = None;
+    }
+
+    pub fn filtered_logs(&self) -> Vec<&LogLine> {
+        let mut logs: Vec<&LogLine> = if let Some(ref filter) = self.filter_process {
+            self.logs.iter().filter(|log| &log.process_name == filter).collect()
+        } else {
+            self.logs.iter().collect()
+        };
+
+        // Apply search filter
+        if !self.search_query.is_empty() {
+            let query = self.search_query.to_lowercase();
+            logs.retain(|log| log.content.to_lowercase().contains(&query));
+        }
+
+        logs
+    }
+
+    pub fn export_logs(&self, path: &str) -> Result<(), std::io::Error> {
+        use std::fs::File;
+        use std::io::Write;
+
+        let mut file = File::create(path)?;
+        for log in &self.logs {
+            writeln!(file, "[{}] {}", log.process_name, log.content)?;
+        }
+        Ok(())
+    }
+
+    pub fn update_processes(&mut self, processes: Vec<ProcessInfo>) {
+        self.processes = processes;
+    }
+
+    pub fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
+    pub fn quit(&mut self) {
+        self.should_quit = true;
+    }
+}
+
+pub async fn run_ui(
+    mut app: App,
+    mut log_rx: mpsc::UnboundedReceiver<LogLine>,
+    process_manager: std::sync::Arc<crate::process::ProcessManager>,
+    _stats_collector: StatsCollector,
+    _context_tracker: std::sync::Arc<RequestContextTracker>,
+    _db_health: std::sync::Arc<DatabaseHealth>,
+    _test_tracker: std::sync::Arc<TestTracker>,
+    _exception_tracker: std::sync::Arc<ExceptionTracker>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    loop {
+        // Receive new logs (non-blocking)
+        while let Ok(log) = log_rx.try_recv() {
+            app.add_log(log);
+        }
+
+        // Update process list
+        let processes = process_manager.get_processes();
+        app.update_processes(processes);
+
+        // Draw UI
+        terminal.draw(|f| ui(f, &app))?;
+
+        // Handle input (with timeout)
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                handle_key_event(&mut app, key);
+            }
+        }
+
+        if app.should_quit() {
+            break;
+        }
+    }
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    Ok(())
+}
+
+fn ui(f: &mut Frame, app: &App) {
+    match &app.view_mode {
+        ViewMode::Logs => render_logs_view(f, app),
+        ViewMode::QueryAnalysis => render_query_analysis_view(f, app),
+        ViewMode::RequestDetail(idx) => render_request_detail_view(f, app, *idx),
+        ViewMode::DatabaseHealth => render_database_health_view(f, app),
+        ViewMode::TestResults => render_test_results_view(f, app),
+        ViewMode::Exceptions => render_exceptions_view(f, app),
+    }
+}
+
+fn render_logs_view(f: &mut Frame, app: &App) {
+    let search_height = if app.search_mode { 3 } else { 0 };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header with stats and git
+            Constraint::Length(app.processes.len() as u16 + 2),
+            Constraint::Length(search_height), // Search bar (if active)
+            Constraint::Min(10),
+            Constraint::Length(1), // Footer with shortcuts
+        ])
+        .split(f.area());
+
+    // Header with stats and git info (Enhanced)
+    let stats = app.stats_collector.get_stats();
+
+    let error_rate = stats.error_rate();
+    let avg_time = stats.avg_response_time();
+
+    // Line 1: Git info
+    let git_line = Line::from(vec![
+        Span::styled("   ", Style::default()),
+        Span::styled("", Style::default().fg(colors::INFO)),
+        Span::raw(" "),
+        Span::styled(
+            app.git_info.format_short(),
+            Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+
+    // Line 2: Stats with icons and better formatting
+    let stats_line = Line::from(vec![
+        Span::styled("   ⚡ ", Style::default().fg(colors::SUCCESS)),
+        Span::styled(format_number(stats.total_requests), Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" requests", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   │   "),
+        Span::styled("", Style::default().fg(colors::WARNING)),
+        Span::raw(" "),
+        Span::styled(format_ms(avg_time), Style::default().fg(colors::duration_color(avg_time)).add_modifier(Modifier::BOLD)),
+        Span::styled(" avg", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   │   "),
+        Span::styled(
+            if error_rate > 5.0 { "✗" } else { "✓" },
+            Style::default().fg(if error_rate > 5.0 { colors::DANGER } else { colors::SUCCESS })
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format_percentage(error_rate),
+            Style::default().fg(if error_rate > 5.0 { colors::DANGER } else { colors::SUCCESS }).add_modifier(Modifier::BOLD)
+        ),
+        Span::styled(" errors", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   │   "),
+        Span::styled(" ", Style::default().fg(colors::INFO)),
+        Span::styled(format_number(stats.sql_queries), Style::default().fg(colors::INFO).add_modifier(Modifier::BOLD)),
+        Span::styled(" queries", Style::default().fg(colors::TEXT_SECONDARY)),
+    ]);
+
+    let header_widget = Paragraph::new(vec![git_line, stats_line])
+        .block(Block::default()
+            .title(Span::styled("  Caboose  ", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::TEXT_MUTED)));
+
+    f.render_widget(header_widget, chunks[0]);
+
+    // Process list (Enhanced)
+    let process_items: Vec<ListItem> = app
+        .processes
+        .iter()
+        .map(|p| {
+            let (status_icon, status_color) = match p.status {
+                ProcessStatus::Running => ("●", colors::SUCCESS_BRIGHT),
+                ProcessStatus::Stopped => ("○", colors::TEXT_MUTED),
+                ProcessStatus::Crashed => ("✗", colors::DANGER),
+            };
+
+            let uptime = p.start_time.map_or("--".to_string(), |start| {
+                let elapsed = start.elapsed().as_secs();
+                format_duration(elapsed)
+            });
+
+            let status_text = format!("{:?}", p.status);
+
+            let content = Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    status_icon,
+                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:14}", p.name),
+                    Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:9}", status_text),
+                    Style::default().fg(status_color),
+                ),
+                Span::styled("  ", Style::default().fg(colors::TEXT_SECONDARY)),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:>10}", uptime),
+                    Style::default().fg(colors::WARNING),
+                ),
+                Span::styled("  │  ", Style::default().fg(colors::TEXT_MUTED)),
+                Span::styled(&p.command[..p.command.len().min(60)], Style::default().fg(colors::TEXT_SECONDARY)),
+            ]);
+
+            ListItem::new(content)
+        })
+        .collect();
+
+    let processes_widget = List::new(process_items)
+        .block(Block::default()
+            .title(Span::styled("  Processes  ", Style::default().fg(colors::TEXT_PRIMARY)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::TEXT_MUTED)));
+
+    f.render_widget(processes_widget, chunks[1]);
+
+    // Search bar (if active)
+    let logs_chunk_idx = if app.search_mode {
+        let search_content = Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(&app.search_query),
+            Span::styled("_", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+        ]);
+
+        let search_widget = Paragraph::new(search_content)
+            .block(Block::default().title("Search (Esc to cancel)").borders(Borders::ALL));
+
+        f.render_widget(search_widget, chunks[2]);
+        3
+    } else {
+        2
+    };
+
+    // Logs with syntax highlighting and filtering
+    let filtered = app.filtered_logs();
+    let total_logs = filtered.len();
+
+    let visible_height = chunks[logs_chunk_idx].height.saturating_sub(2) as usize;
+    let start_idx = app.log_scroll.min(total_logs.saturating_sub(visible_height));
+
+    let log_lines: Vec<Line> = filtered
+        .iter()
+        .skip(start_idx)
+        .take(visible_height)
+        .map(|log| {
+            // Check if this is a SQL query
+            let content_style = if log.content.contains("SELECT") || log.content.contains("INSERT") ||
+                               log.content.contains("UPDATE") || log.content.contains("DELETE") {
+                Style::default().fg(Color::Magenta)
+            } else if log.content.contains("ERROR") || log.content.contains("Exception") {
+                Style::default().fg(Color::Red)
+            } else if log.content.contains("Completed") {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default()
+            };
+
+            Line::from(vec![
+                Span::styled(
+                    format!("[{:8}] ", log.process_name),
+                    Style::default().fg(process_name_color(&log.process_name)),
+                ),
+                Span::styled(&log.content, content_style),
+            ])
+        })
+        .collect();
+
+    let scroll_indicator = create_scroll_indicator(start_idx, total_logs, visible_height);
+
+    let log_title = if let Some(ref filter) = app.filter_process {
+        format!("  Logs  {} {} / {}{}", filter, format_number(start_idx + 1), format_number(total_logs), scroll_indicator)
+    } else if !app.search_query.is_empty() {
+        format!("  Logs  {} {} / {}{}", app.search_query, format_number(start_idx + 1), format_number(total_logs), scroll_indicator)
+    } else {
+        format!("  Logs  {} / {}{}", format_number(start_idx + 1), format_number(total_logs.max(1)), scroll_indicator)
+    };
+
+    let logs_widget = Paragraph::new(log_lines)
+        .block(Block::default()
+            .title(Span::styled(log_title, Style::default().fg(colors::TEXT_PRIMARY)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::TEXT_MUTED)));
+
+    f.render_widget(logs_widget, chunks[logs_chunk_idx]);
+
+    // Footer with keyboard shortcuts (Enhanced)
+    let footer_content = if app.search_mode {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Type to search", Style::default().fg(colors::WARNING_BRIGHT)),
+            Span::raw("   "),
+            Span::styled("Esc", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" Cancel", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::raw("   "),
+            Span::styled("Enter", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" Apply", Style::default().fg(colors::TEXT_SECONDARY)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("q", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" Quit", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::raw("   "),
+            Span::styled("t", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" Query Analysis", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::raw("   "),
+            Span::styled("/", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" Search", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::raw("   "),
+            Span::styled("↑↓", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" Scroll", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::raw("   "),
+            Span::styled("c", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" Clear", Style::default().fg(colors::TEXT_SECONDARY)),
+        ])
+    };
+
+    let footer_widget = Paragraph::new(footer_content)
+        .style(Style::default().bg(colors::BG_HIGHLIGHT));
+
+    let footer_idx = if app.search_mode { 4 } else { 3 };
+    f.render_widget(footer_widget, chunks[footer_idx]);
+}
+
+fn render_query_analysis_view(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(10),   // N+1 issues
+            Constraint::Min(10),   // Recent requests
+            Constraint::Length(1), // Footer with shortcuts
+        ])
+        .split(f.area());
+
+    // Header (Enhanced)
+    let stats = app.stats_collector.get_stats();
+    let n_plus_one_issues = app.context_tracker.get_all_n_plus_one_issues();
+
+    let issue_count = n_plus_one_issues.len();
+    let issue_color = if issue_count == 0 { colors::SUCCESS } else { colors::DANGER };
+
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled("   ", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled("Query Analysis", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("   ⚡ ", Style::default().fg(colors::INFO)),
+            Span::styled(format_number(stats.total_requests), Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" requests analyzed", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::raw("   │   "),
+            Span::styled(
+                if issue_count == 0 { "✓" } else { "⚠" },
+                Style::default().fg(issue_color).add_modifier(Modifier::BOLD)
+            ),
+            Span::raw(" "),
+            Span::styled(format_number(issue_count), Style::default().fg(issue_color).add_modifier(Modifier::BOLD)),
+            Span::styled(" N+1 issues", Style::default().fg(colors::TEXT_SECONDARY)),
+        ]),
+    ];
+
+    let header_widget = Paragraph::new(header_lines)
+        .block(Block::default()
+            .title(Span::styled("  Query Analysis  ", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::TEXT_MUTED)));
+
+    f.render_widget(header_widget, chunks[0]);
+
+    // N+1 Issues (Enhanced)
+    let n_plus_one_items: Vec<ListItem> = n_plus_one_issues
+        .iter()
+        .take(chunks[1].height as usize - 2)
+        .map(|issue| {
+            let content = vec![
+                Line::from(vec![
+                    Span::styled("   ⚠ ", Style::default().fg(colors::DANGER).add_modifier(Modifier::BOLD)),
+                    Span::styled("N+1 Query Detected", Style::default().fg(colors::DANGER).add_modifier(Modifier::BOLD)),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{}× executions", issue.count),
+                        Style::default().fg(colors::WARNING_BRIGHT),
+                    ),
+                    Span::styled("  │  ", Style::default().fg(colors::TEXT_MUTED)),
+                    Span::styled(
+                        format_ms(issue.total_duration),
+                        Style::default().fg(colors::duration_color(issue.total_duration)),
+                    ),
+                    Span::styled(" total", Style::default().fg(colors::TEXT_SECONDARY)),
+                ]),
+                Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(&issue.sample_query[..issue.sample_query.len().min(95)], Style::default().fg(colors::INFO)),
+                ]),
+                Line::from(vec![
+                    Span::styled("     💡 ", Style::default().fg(colors::WARNING)),
+                    Span::styled(&issue.suggestion, Style::default().fg(colors::TEXT_SECONDARY)),
+                ]),
+                Line::from(""),
+            ];
+
+            ListItem::new(content)
+        })
+        .collect();
+
+    let n_plus_one_widget = if n_plus_one_items.is_empty() {
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("     ✓ ", Style::default().fg(colors::SUCCESS_BRIGHT).add_modifier(Modifier::BOLD)),
+                Span::styled("No N+1 queries detected! ", Style::default().fg(colors::SUCCESS)),
+                Span::styled("Your queries are optimized.", Style::default().fg(colors::TEXT_SECONDARY)),
+            ]),
+        ])
+            .block(Block::default()
+                .title(Span::styled("  N+1 Detection  ", Style::default().fg(colors::TEXT_PRIMARY)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::TEXT_MUTED)))
+    } else {
+        let list = List::new(n_plus_one_items)
+            .block(Block::default()
+                .title(Span::styled(format!("  N+1 Detection ({} issues)  ", issue_count), Style::default().fg(colors::DANGER)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::TEXT_MUTED)));
+        f.render_widget(list, chunks[1]);
+        return;
+    };
+
+    f.render_widget(n_plus_one_widget, chunks[1]);
+
+    // Recent Requests (Enhanced)
+    let recent_requests = app.context_tracker.get_recent_requests();
+    let request_items: Vec<ListItem> = recent_requests
+        .iter()
+        .rev()
+        .take(chunks[2].height as usize - 2)
+        .map(|req| {
+            let path = req.context.path.clone().unwrap_or_else(|| "Unknown".to_string());
+            let query_count = req.context.query_count();
+            let total_time = req.context.total_query_time();
+            let status = req.status.unwrap_or(0);
+
+            let status_color = if status >= 200 && status < 300 {
+                colors::SUCCESS
+            } else if status >= 400 {
+                colors::DANGER
+            } else {
+                colors::WARNING
+            };
+
+            let content = Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:3}", status),
+                    Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:48}", if path.len() > 48 { format!("{}...", &path[..45]) } else { path.clone() }),
+                    Style::default().fg(colors::PRIMARY),
+                ),
+                Span::styled("  ", Style::default().fg(colors::TEXT_MUTED)),
+                Span::styled(
+                    format!("{:>3}", query_count),
+                    Style::default().fg(colors::INFO).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" queries ", Style::default().fg(colors::TEXT_SECONDARY)),
+                Span::styled("│ ", Style::default().fg(colors::TEXT_MUTED)),
+                Span::styled(
+                    format_ms(total_time),
+                    Style::default().fg(colors::duration_color(total_time)),
+                ),
+            ]);
+
+            ListItem::new(content)
+        })
+        .collect();
+
+    // Highlight selected request
+    let mut highlighted_items = Vec::new();
+    for (idx, item) in request_items.into_iter().enumerate() {
+        let style = if idx == app.selected_request {
+            Style::default().bg(colors::BG_SELECTED)
+        } else {
+            Style::default()
+        };
+        highlighted_items.push(item.style(style));
+    }
+
+    let requests_widget = List::new(highlighted_items)
+        .block(Block::default()
+            .title(Span::styled(format!("  Recent Requests  {} selected", app.selected_request + 1), Style::default().fg(colors::TEXT_PRIMARY)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::TEXT_MUTED)));
+
+    f.render_widget(requests_widget, chunks[2]);
+
+    // Footer (Enhanced)
+    let footer_content = Line::from(vec![
+        Span::raw("  "),
+        Span::styled("q", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Quit", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("t", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Cycle Views", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("↑↓", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Navigate", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("Enter", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" View Details", Style::default().fg(colors::TEXT_SECONDARY)),
+    ]);
+
+    let footer_widget = Paragraph::new(footer_content)
+        .style(Style::default().bg(colors::BG_HIGHLIGHT));
+
+    f.render_widget(footer_widget, chunks[3]);
+}
+
+fn render_request_detail_view(f: &mut Frame, app: &App, selected_idx: usize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),  // Request header
+            Constraint::Min(10),    // Query timeline
+            Constraint::Length(1),  // Footer
+        ])
+        .split(f.area());
+
+    let recent_requests = app.context_tracker.get_recent_requests();
+
+    if selected_idx >= recent_requests.len() {
+        // Invalid selection, show error
+        let error_widget = Paragraph::new("Request not found")
+            .block(Block::default().title("Error").borders(Borders::ALL));
+        f.render_widget(error_widget, f.area());
+        return;
+    }
+
+    let request = &recent_requests[recent_requests.len() - 1 - selected_idx];
+
+    // Request header (Enhanced)
+    let path = request.context.path.clone().unwrap_or_else(|| "Unknown".to_string());
+    let status = request.status.unwrap_or(0);
+    let query_count = request.context.query_count();
+    let total_time = request.context.total_query_time();
+    let duration = request.total_duration.unwrap_or(0.0);
+
+    let status_color = if status >= 200 && status < 300 {
+        colors::SUCCESS
+    } else if status >= 400 {
+        colors::DANGER
+    } else {
+        colors::WARNING
+    };
+
+    // Calculate DB time percentage
+    let db_percentage = if duration > 0.0 {
+        (total_time / duration * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled("   ", Style::default().fg(colors::INFO).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled("Request Details", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("   ", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::raw(" "),
+            Span::styled(&path, Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled("Status: ", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::styled(format!("{}", status), Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::raw("   │   "),
+            Span::styled("Duration: ", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::styled(format_ms(duration), Style::default().fg(colors::duration_color(duration)).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled("Queries: ", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::styled(format!("{}", query_count), Style::default().fg(colors::INFO).add_modifier(Modifier::BOLD)),
+            Span::raw("   │   "),
+            Span::styled("DB Time: ", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::styled(format_ms(total_time), Style::default().fg(colors::duration_color(total_time)).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" ({:.1}%)", db_percentage), Style::default().fg(colors::TEXT_MUTED)),
+        ]),
+    ];
+
+    let header_widget = Paragraph::new(header_lines)
+        .block(Block::default()
+            .title(Span::styled("  Request Details  ", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::TEXT_MUTED)));
+
+    f.render_widget(header_widget, chunks[0]);
+
+    // Query timeline (Enhanced)
+    let max_duration = request.context.queries.iter()
+        .map(|q| q.duration)
+        .fold(0.0f64, |a, b| a.max(b));
+
+    let query_lines: Vec<Line> = request.context.queries
+        .iter()
+        .enumerate()
+        .map(|(idx, query)| {
+            let duration_color = colors::duration_color(query.duration);
+
+            // Create proportional bar (max 20 chars)
+            let bar_width = if max_duration > 0.0 {
+                ((query.duration / max_duration) * 20.0) as usize
+            } else {
+                0
+            };
+            let bar = "▅".repeat(bar_width.max(1));
+
+            Line::from(vec![
+                Span::styled(format!(" {:>3}. ", idx + 1), Style::default().fg(colors::TEXT_MUTED)),
+                Span::styled(
+                    format!("{:>8}", format_ms(query.duration)),
+                    Style::default().fg(duration_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(format!("{:20}", bar), Style::default().fg(duration_color)),
+                Span::raw("  "),
+                Span::styled(&query.raw_query[..query.raw_query.len().min(70)], Style::default().fg(colors::INFO)),
+            ])
+        })
+        .collect();
+
+    let timeline_widget = Paragraph::new(query_lines)
+        .block(Block::default()
+            .title(Span::styled("  Query Timeline  ", Style::default().fg(colors::TEXT_PRIMARY)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::TEXT_MUTED)))
+        .scroll((0, 0));
+
+    f.render_widget(timeline_widget, chunks[1]);
+
+    // Footer (Enhanced)
+    let footer_content = Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Esc", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Back", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("t", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Cycle Views", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("q", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Quit", Style::default().fg(colors::TEXT_SECONDARY)),
+    ]);
+
+    let footer_widget = Paragraph::new(footer_content)
+        .style(Style::default().bg(colors::BG_HIGHLIGHT));
+
+    f.render_widget(footer_widget, chunks[2]);
+}
+
+fn render_database_health_view(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),  // Health score header
+            Constraint::Min(10),    // Issues list
+            Constraint::Min(8),     // Slow queries or stats
+            Constraint::Length(1),  // Footer
+        ])
+        .split(f.area());
+
+    // Health score header (Enhanced with gauge)
+    let health_score = app.db_health.calculate_health_score();
+    let score_color = colors::health_color(health_score.min(100) as u8);
+
+    let db_stats = app.db_health.get_stats();
+    let issues = app.db_health.get_issues();
+
+    // Create health gauge (40 characters wide)
+    let health_gauge = create_gauge(health_score as f64, 40);
+
+    let (status_icon, status_text) = if health_score >= 90 {
+        ("✓", "Excellent")
+    } else if health_score >= 80 {
+        ("✓", "Very Good")
+    } else if health_score >= 70 {
+        ("⚠", "Good")
+    } else if health_score >= 60 {
+        ("⚠", "Fair")
+    } else {
+        ("✗", "Needs Attention")
+    };
+
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled("   ", Style::default().fg(score_color).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled("Database Health Dashboard", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled(
+                status_icon,
+                Style::default().fg(score_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>3}/100", health_score),
+                Style::default().fg(score_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(health_gauge, Style::default().fg(score_color)),
+            Span::raw("  "),
+            Span::styled(status_text, Style::default().fg(score_color)),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled(" ", Style::default().fg(colors::INFO)),
+            Span::raw(" "),
+            Span::styled(format_number(db_stats.total_queries), Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" queries", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::raw("   │   "),
+            Span::styled("", Style::default().fg(if db_stats.slow_queries_count > 10 { colors::DANGER } else { colors::SUCCESS })),
+            Span::raw(" "),
+            Span::styled(
+                format_number(db_stats.slow_queries_count),
+                Style::default().fg(if db_stats.slow_queries_count > 10 { colors::DANGER } else { colors::SUCCESS }).add_modifier(Modifier::BOLD)
+            ),
+            Span::styled(" slow", Style::default().fg(colors::TEXT_SECONDARY)),
+            Span::raw("   │   "),
+            Span::styled("⚠ ", Style::default().fg(if issues.is_empty() { colors::SUCCESS } else { colors::WARNING })),
+            Span::styled(
+                format_number(issues.len()),
+                Style::default().fg(if issues.is_empty() { colors::SUCCESS } else { colors::WARNING }).add_modifier(Modifier::BOLD)
+            ),
+            Span::styled(" issues", Style::default().fg(colors::TEXT_SECONDARY)),
+        ]),
+    ];
+
+    let header_widget = Paragraph::new(header_lines)
+        .block(Block::default()
+            .title(Span::styled("  Database Health  ", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::TEXT_MUTED)));
+
+    f.render_widget(header_widget, chunks[0]);
+
+    // Issues list (Enhanced)
+    let issue_items: Vec<ListItem> = issues
+        .iter()
+        .take(chunks[1].height as usize - 2)
+        .map(|issue| {
+            let severity_color = match issue.severity {
+                crate::database::IssueSeverity::Critical => colors::DANGER,
+                crate::database::IssueSeverity::High => colors::DANGER_BRIGHT,
+                crate::database::IssueSeverity::Medium => colors::WARNING,
+                crate::database::IssueSeverity::Low => colors::TEXT_MUTED,
+            };
+
+            let severity_icon = match issue.severity {
+                crate::database::IssueSeverity::Critical => "✗",
+                crate::database::IssueSeverity::High => "⚠",
+                crate::database::IssueSeverity::Medium => "!",
+                crate::database::IssueSeverity::Low => "ⓘ",
+            };
+
+            let content = vec![
+                Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(
+                        severity_icon,
+                        Style::default().fg(severity_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(&issue.title, Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(&issue.description, Style::default().fg(colors::TEXT_SECONDARY)),
+                ]),
+                Line::from(vec![
+                    Span::styled("      💡 ", Style::default().fg(colors::WARNING)),
+                    Span::styled(&issue.recommendation, Style::default().fg(colors::TEXT_SECONDARY)),
+                ]),
+                Line::from(""),
+            ];
+
+            ListItem::new(content)
+        })
+        .collect();
+
+    let issues_widget = if issue_items.is_empty() {
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("     ✓ ", Style::default().fg(colors::SUCCESS_BRIGHT).add_modifier(Modifier::BOLD)),
+                Span::styled("No issues detected! ", Style::default().fg(colors::SUCCESS)),
+                Span::styled("Your database queries are performing well.", Style::default().fg(colors::TEXT_SECONDARY)),
+            ]),
+        ])
+            .block(Block::default()
+                .title(Span::styled("  Issues  ", Style::default().fg(colors::TEXT_PRIMARY)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::TEXT_MUTED)))
+    } else {
+        let list = List::new(issue_items)
+            .block(Block::default()
+                .title(Span::styled(format!("  Issues ({})  ", issues.len()), Style::default().fg(colors::WARNING)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(colors::TEXT_MUTED)));
+        f.render_widget(list, chunks[1]);
+        return;
+    };
+
+    f.render_widget(issues_widget, chunks[1]);
+
+    // Slow queries (Enhanced with duration bars)
+    let slow_queries = app.db_health.get_slow_queries();
+    let content_lines: Vec<Line> = if !slow_queries.is_empty() {
+        let max_duration = slow_queries.iter().map(|sq| sq.duration).fold(0.0f64, |a, b| a.max(b));
+
+        slow_queries
+            .iter()
+            .take(chunks[2].height as usize - 2)
+            .map(|sq| {
+                let duration_color = colors::duration_color(sq.duration);
+
+                // Create a small bar chart (10 chars wide)
+                let bar_width = ((sq.duration / max_duration) * 10.0) as usize;
+                let bar = "▅".repeat(bar_width.max(1));
+
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{:>8}", format_ms(sq.duration)),
+                        Style::default().fg(duration_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(bar, Style::default().fg(duration_color)),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{:>3}×", sq.execution_count),
+                        Style::default().fg(colors::TEXT_MUTED),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(&sq.query[..sq.query.len().min(70)], Style::default().fg(colors::INFO)),
+                ])
+            })
+            .collect()
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("     ✓ ", Style::default().fg(colors::SUCCESS_BRIGHT).add_modifier(Modifier::BOLD)),
+                Span::styled("No slow queries detected", Style::default().fg(colors::SUCCESS)),
+            ])
+        ]
+    };
+
+    let bottom_widget = Paragraph::new(content_lines)
+        .block(Block::default()
+            .title(Span::styled("  Slowest Queries (>100ms)  ", Style::default().fg(colors::TEXT_PRIMARY)))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(colors::TEXT_MUTED)));
+
+    f.render_widget(bottom_widget, chunks[2]);
+
+    // Footer (Enhanced)
+    let footer_content = Line::from(vec![
+        Span::raw("  "),
+        Span::styled("q", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Quit", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("t", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Cycle Views", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("Esc", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Back", Style::default().fg(colors::TEXT_SECONDARY)),
+    ]);
+
+    let footer_widget = Paragraph::new(footer_content)
+        .style(Style::default().bg(colors::BG_HIGHLIGHT));
+
+    f.render_widget(footer_widget, chunks[3]);
+}
+
+fn render_test_results_view(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),  // Header with stats
+            Constraint::Min(10),    // Main content
+            Constraint::Length(3),  // Footer
+        ])
+        .split(f.area());
+
+    // === HEADER: Test Statistics (Enhanced) ===
+    let stats = app.test_tracker.get_stats();
+    let current_run = app.test_tracker.get_current_run();
+
+    let success_rate = if stats.total_tests_run > 0 {
+        (stats.total_passed as f64 / stats.total_tests_run as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let success_color = if success_rate >= 90.0 {
+        colors::SUCCESS_BRIGHT
+    } else if success_rate >= 70.0 {
+        colors::WARNING
+    } else {
+        colors::DANGER
+    };
+
+    // Create success rate gauge (30 characters wide)
+    let success_gauge = create_gauge(success_rate, 30);
+
+    let mut header_lines = vec![
+        Line::from(vec![
+            Span::styled("   ", Style::default().fg(colors::INFO).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled("Test Dashboard", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+    ];
+
+    header_lines.push(Line::from(vec![
+        Span::raw("   "),
+        Span::styled(" ", Style::default().fg(colors::INFO)),
+        Span::raw(" "),
+        Span::styled(format_number(stats.total_runs), Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" runs", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   │   "),
+        Span::styled(format_number(stats.total_tests_run), Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" tests", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   │   "),
+        Span::styled("✓ ", Style::default().fg(colors::SUCCESS)),
+        Span::styled(format_number(stats.total_passed), Style::default().fg(colors::SUCCESS).add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+        Span::styled(
+            if stats.total_failed > 0 { "✗ " } else { "" },
+            Style::default().fg(colors::DANGER)
+        ),
+        Span::styled(
+            if stats.total_failed > 0 { format_number(stats.total_failed) } else { String::new() },
+            if stats.total_failed > 0 { Style::default().fg(colors::DANGER).add_modifier(Modifier::BOLD) } else { Style::default() }
+        ),
+    ]));
+
+    header_lines.push(Line::from(vec![
+        Span::raw("   "),
+        Span::styled(
+            if success_rate >= 90.0 { "✓" } else if success_rate >= 70.0 { "⚠" } else { "✗" },
+            Style::default().fg(success_color).add_modifier(Modifier::BOLD)
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{:>5.1}%", success_rate),
+            Style::default().fg(success_color).add_modifier(Modifier::BOLD)
+        ),
+        Span::raw("  "),
+        Span::styled(success_gauge, Style::default().fg(success_color)),
+        Span::raw("  "),
+        Span::styled(
+            stats.average_duration.map_or("N/A".to_string(), |d| format!("avg {:.2}s", d)),
+            Style::default().fg(colors::TEXT_SECONDARY)
+        ),
+    ]));
+
+    let header = Paragraph::new(header_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled("  Test Results  ", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)))
+            .border_style(Style::default().fg(colors::TEXT_MUTED)));
+
+    f.render_widget(header, chunks[0]);
+
+    // === MAIN CONTENT ===
+    let content_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(40),  // Current run / failed tests
+            Constraint::Percentage(30),  // Slowest tests
+            Constraint::Percentage(30),  // Debugger info / recent runs
+        ])
+        .split(chunks[1]);
+
+    // === SECTION 1: Current Run or Failed Tests ===
+    if let Some(run) = current_run {
+        let mut run_lines = vec![
+            Line::from(vec![
+                Span::styled("Framework: ", Style::default().fg(Color::Gray)),
+                Span::styled(format!("{:?}", run.framework), Style::default().fg(Color::Cyan)),
+                Span::raw("  │  "),
+                Span::styled("Status: ", Style::default().fg(Color::Gray)),
+                Span::styled("Running...", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(format!("  {} ", run.total_tests), Style::default().fg(Color::White)),
+                Span::raw("tests  │  "),
+                Span::styled(format!("{} ", run.passed), Style::default().fg(Color::Green)),
+                Span::raw("passed  │  "),
+                Span::styled(format!("{} ", run.failed), Style::default().fg(Color::Red)),
+                Span::raw("failed"),
+            ]),
+        ];
+
+        if run.failed > 0 {
+            run_lines.push(Line::from(""));
+            run_lines.push(Line::from(vec![
+                Span::styled("Recent Failures:", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            ]));
+
+            for test in run.failed_tests().iter().take(5) {
+                run_lines.push(Line::from(vec![
+                    Span::styled("  ✗ ", Style::default().fg(Color::Red)),
+                    Span::raw(&test.test_name[..test.test_name.len().min(70)]),
+                ]));
+            }
+        }
+
+        let current_run_widget = Paragraph::new(run_lines)
+            .block(Block::default().borders(Borders::ALL).title("Current Test Run"));
+
+        f.render_widget(current_run_widget, content_chunks[0]);
+    } else {
+        // Show recent runs if no current run
+        let recent_runs = app.test_tracker.get_recent_runs();
+
+        let run_items: Vec<ListItem> = if recent_runs.is_empty() {
+            vec![ListItem::new(Line::from(vec![
+                Span::styled("No test runs detected yet", Style::default().fg(Color::Gray)),
+            ]))]
+        } else {
+            recent_runs.iter().rev().take(8).map(|run| {
+                let status_icon = if run.failed == 0 { "✓" } else { "✗" };
+                let status_color = if run.failed == 0 { Color::Green } else { Color::Red };
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("  {} ", status_icon), Style::default().fg(status_color)),
+                    Span::styled(format!("{:?}", run.framework), Style::default().fg(Color::Cyan)),
+                    Span::raw("  │  "),
+                    Span::styled(format!("{} ", run.total_tests), Style::default().fg(Color::White)),
+                    Span::raw("tests  │  "),
+                    Span::styled(format!("{} ", run.passed), Style::default().fg(Color::Green)),
+                    Span::raw("passed"),
+                    if run.failed > 0 {
+                        Span::styled(format!("  │  {} failed", run.failed), Style::default().fg(Color::Red))
+                    } else {
+                        Span::raw("")
+                    },
+                ]))
+            }).collect()
+        };
+
+        let recent_runs_widget = List::new(run_items)
+            .block(Block::default().borders(Borders::ALL).title("Recent Test Runs"));
+
+        f.render_widget(recent_runs_widget, content_chunks[0]);
+    }
+
+    // === SECTION 2: Slowest Tests ===
+    let slow_test_items: Vec<ListItem> = if stats.slowest_tests.is_empty() {
+        vec![ListItem::new(Line::from(vec![
+            Span::styled("No slow tests detected", Style::default().fg(Color::Gray)),
+        ]))]
+    } else {
+        stats.slowest_tests.iter().take(8).map(|test| {
+            let duration = test.duration.unwrap_or(0.0);
+            let duration_color = if duration > 500.0 {
+                Color::Red
+            } else if duration > 200.0 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
+
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("  {:>7.1}ms ", duration), Style::default().fg(duration_color)),
+                Span::raw("│  "),
+                Span::raw(&test.test_name[..test.test_name.len().min(60)]),
+            ]))
+        }).collect()
+    };
+
+    let slow_tests_widget = List::new(slow_test_items)
+        .block(Block::default().borders(Borders::ALL).title("Slowest Tests (>100ms)"));
+
+    f.render_widget(slow_tests_widget, content_chunks[1]);
+
+    // === SECTION 3: Debugger Info ===
+    let debugger_active = app.test_tracker.is_debugger_active();
+    let debugger_info = app.test_tracker.get_debugger_info();
+
+    let debugger_lines = if debugger_active {
+        if let Some(info) = debugger_info {
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("⚠ Debugger Active", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Type: ", Style::default().fg(Color::Gray)),
+                    Span::styled(format!("{:?}", info.debugger_type), Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(""),
+            ];
+
+            // Add file path line if available
+            if let Some(ref path) = info.file_path {
+                let mut file_spans = vec![
+                    Span::styled("File: ", Style::default().fg(Color::Gray)),
+                    Span::styled(path.clone(), Style::default().fg(Color::White)),
+                ];
+                if let Some(line_num) = info.line_number {
+                    file_spans.push(Span::styled(format!(":{}", line_num), Style::default().fg(Color::Yellow)));
+                }
+                lines.push(Line::from(file_spans));
+            }
+
+            lines
+        } else {
+            vec![Line::from(vec![
+                Span::styled("Debugger active (no details)", Style::default().fg(Color::Yellow)),
+            ])]
+        }
+    } else {
+        vec![Line::from(vec![
+            Span::styled("No active debugger session", Style::default().fg(Color::Gray)),
+        ])]
+    };
+
+    let debugger_widget = Paragraph::new(debugger_lines)
+        .block(Block::default().borders(Borders::ALL).title("Debugger Status"));
+
+    f.render_widget(debugger_widget, content_chunks[2]);
+
+    // === FOOTER (Enhanced) ===
+    let footer_content = Line::from(vec![
+        Span::raw("  "),
+        Span::styled("q", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Quit", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("t", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Cycle Views", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("Esc", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Back", Style::default().fg(colors::TEXT_SECONDARY)),
+    ]);
+
+    let footer_widget = Paragraph::new(footer_content)
+        .style(Style::default().bg(colors::BG_HIGHLIGHT));
+
+    f.render_widget(footer_widget, chunks[2]);
+}
+
+fn render_exceptions_view(f: &mut Frame, app: &App) {
+    use crate::exception::ExceptionSeverity;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),  // Header with stats
+            Constraint::Min(10),    // Main content
+            Constraint::Length(3),  // Footer
+        ])
+        .split(f.area());
+
+    // === HEADER: Exception Statistics (Enhanced) ===
+    let stats = app.exception_tracker.get_stats();
+
+    let mut header_lines = vec![
+        Line::from(vec![
+            Span::styled("   ", Style::default().fg(colors::DANGER).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled("Exception Tracking", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+    ];
+
+    header_lines.push(Line::from(vec![
+        Span::raw("   "),
+        Span::styled("⚠ ", Style::default().fg(colors::WARNING)),
+        Span::styled(format_number(stats.total_exceptions), Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" total", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   │   "),
+        Span::styled(" ", Style::default().fg(colors::INFO)),
+        Span::styled(format_number(stats.unique_exceptions), Style::default().fg(colors::INFO).add_modifier(Modifier::BOLD)),
+        Span::styled(" unique", Style::default().fg(colors::TEXT_SECONDARY)),
+    ]));
+
+    header_lines.push(Line::from(vec![
+        Span::raw("   "),
+        Span::styled("✗ ", Style::default().fg(colors::DANGER)),
+        Span::styled(format_number(stats.critical_count), Style::default().fg(colors::DANGER).add_modifier(Modifier::BOLD)),
+        Span::styled(" critical", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("⚠ ", Style::default().fg(colors::DANGER_BRIGHT)),
+        Span::styled(format_number(stats.high_count), Style::default().fg(colors::DANGER_BRIGHT).add_modifier(Modifier::BOLD)),
+        Span::styled(" high", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("! ", Style::default().fg(colors::WARNING)),
+        Span::styled(format_number(stats.medium_count), Style::default().fg(colors::WARNING).add_modifier(Modifier::BOLD)),
+        Span::styled(" medium", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("ⓘ ", Style::default().fg(colors::TEXT_MUTED)),
+        Span::styled(format_number(stats.low_count), Style::default().fg(colors::TEXT_MUTED).add_modifier(Modifier::BOLD)),
+        Span::styled(" low", Style::default().fg(colors::TEXT_SECONDARY)),
+    ]));
+
+    let header = Paragraph::new(header_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled("  Exception Dashboard  ", Style::default().fg(colors::PRIMARY).add_modifier(Modifier::BOLD)))
+            .border_style(Style::default().fg(colors::TEXT_MUTED)));
+
+    f.render_widget(header, chunks[0]);
+
+    // === MAIN CONTENT ===
+    let content_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(60),  // Grouped exceptions
+            Constraint::Percentage(40),  // Recent exceptions
+        ])
+        .split(chunks[1]);
+
+    // === SECTION 1: Grouped Exceptions (Most Frequent) ===
+    let grouped = app.exception_tracker.get_top_exceptions(15);
+
+    let exception_items: Vec<ListItem> = if grouped.is_empty() {
+        vec![ListItem::new(Line::from(vec![
+            Span::styled("No exceptions detected", Style::default().fg(Color::Green)),
+        ]))]
+    } else {
+        grouped.iter().enumerate().map(|(idx, group)| {
+            let severity = ExceptionSeverity::from_exception_type(&group.exception_type);
+            let severity_color = match severity {
+                ExceptionSeverity::Critical => Color::Red,
+                ExceptionSeverity::High => Color::LightRed,
+                ExceptionSeverity::Medium => Color::Yellow,
+                ExceptionSeverity::Low => Color::Gray,
+            };
+
+            let is_selected = idx == app.selected_exception;
+            let bg_color = if is_selected { Some(Color::DarkGray) } else { None };
+
+            // Format: icon count×  ExceptionType: message
+            let count_text = if group.count > 1 {
+                format!("{}× ", group.count)
+            } else {
+                "   ".to_string()
+            };
+
+            let mut spans = vec![
+                Span::styled(
+                    format!("  {} ", severity.icon()),
+                    Style::default().fg(severity_color)
+                ),
+                Span::styled(
+                    count_text,
+                    Style::default().fg(Color::Cyan)
+                ),
+                Span::styled(
+                    &group.exception_type,
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                ),
+                Span::raw(": "),
+            ];
+
+            // Add message (truncated)
+            let max_msg_len = 60;
+            let msg = if group.message_pattern.len() > max_msg_len {
+                format!("{}...", &group.message_pattern[..max_msg_len])
+            } else {
+                group.message_pattern.clone()
+            };
+            spans.push(Span::styled(msg, Style::default().fg(Color::Gray)));
+
+            let mut style = Style::default();
+            if let Some(bg) = bg_color {
+                style = style.bg(bg);
+            }
+
+            ListItem::new(Line::from(spans)).style(style)
+        }).collect()
+    };
+
+    let exception_list = List::new(exception_items)
+        .block(Block::default().borders(Borders::ALL).title(
+            format!("Grouped Exceptions (by frequency) - {} unique", stats.unique_exceptions)
+        ));
+
+    f.render_widget(exception_list, content_chunks[0]);
+
+    // === SECTION 2: Recent Exceptions ===
+    let recent = app.exception_tracker.get_recent_exceptions(8);
+
+    let recent_items: Vec<ListItem> = if recent.is_empty() {
+        vec![ListItem::new(Line::from(vec![
+            Span::styled("No recent exceptions", Style::default().fg(Color::Green)),
+        ]))]
+    } else {
+        recent.iter().map(|exc| {
+            let severity = ExceptionSeverity::from_exception_type(&exc.exception_type);
+            let severity_color = match severity {
+                ExceptionSeverity::Critical => Color::Red,
+                ExceptionSeverity::High => Color::LightRed,
+                ExceptionSeverity::Medium => Color::Yellow,
+                ExceptionSeverity::Low => Color::Gray,
+            };
+
+            let location = if let (Some(file), Some(line)) = (&exc.file_path, exc.line_number) {
+                format!(" ({}:{})", file, line)
+            } else if let Some(file) = &exc.file_path {
+                format!(" ({})", file)
+            } else {
+                String::new()
+            };
+
+            let mut spans = vec![
+                Span::styled(
+                    format!("  {} ", severity.icon()),
+                    Style::default().fg(severity_color)
+                ),
+                Span::styled(
+                    &exc.exception_type,
+                    Style::default().fg(Color::White)
+                ),
+                Span::raw(": "),
+            ];
+
+            // Add message (truncated)
+            let max_msg_len = 50;
+            let msg = if exc.message.len() > max_msg_len {
+                format!("{}...", &exc.message[..max_msg_len])
+            } else {
+                exc.message.clone()
+            };
+            spans.push(Span::styled(msg, Style::default().fg(Color::Gray)));
+
+            if !location.is_empty() {
+                spans.push(Span::styled(location, Style::default().fg(Color::DarkGray)));
+            }
+
+            ListItem::new(Line::from(spans))
+        }).collect()
+    };
+
+    let recent_list = List::new(recent_items)
+        .block(Block::default().borders(Borders::ALL).title("Recent Exceptions"));
+
+    f.render_widget(recent_list, content_chunks[1]);
+
+    // === FOOTER (Enhanced) ===
+    let footer_content = Line::from(vec![
+        Span::raw("  "),
+        Span::styled("q", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Quit", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("t", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Cycle Views", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("↑↓", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Navigate", Style::default().fg(colors::TEXT_SECONDARY)),
+        Span::raw("   "),
+        Span::styled("Esc", Style::default().fg(colors::TEXT_PRIMARY).add_modifier(Modifier::BOLD)),
+        Span::styled(" Back", Style::default().fg(colors::TEXT_SECONDARY)),
+    ]);
+
+    let footer_widget = Paragraph::new(footer_content)
+        .style(Style::default().bg(colors::BG_HIGHLIGHT));
+
+    f.render_widget(footer_widget, chunks[2]);
+}
+
+fn handle_key_event(app: &mut App, key: KeyEvent) {
+    // Handle search mode separately
+    if app.search_mode {
+        match key.code {
+            KeyCode::Char(c) => app.add_search_char(c),
+            KeyCode::Backspace => app.remove_search_char(),
+            KeyCode::Esc => app.exit_search_mode(),
+            KeyCode::Enter => app.exit_search_mode(),
+            _ => {}
+        }
+        return;
+    }
+
+    // Normal mode key handling
+    match key.code {
+        KeyCode::Char('q') => app.quit(),
+        KeyCode::Esc => {
+            // Exit from detail view or quit
+            match app.view_mode {
+                ViewMode::RequestDetail(_) => app.view_mode = ViewMode::QueryAnalysis,
+                _ => app.quit(),
+            }
+        }
+        KeyCode::Char('t') => app.toggle_view(),
+        KeyCode::Char('/') => {
+            if matches!(app.view_mode, ViewMode::Logs) {
+                app.enter_search_mode();
+            }
+        }
+        KeyCode::Char('c') => app.clear_filter(),
+        KeyCode::Up => {
+            match app.view_mode {
+                ViewMode::Logs => app.scroll_up(),
+                ViewMode::QueryAnalysis => app.select_previous_request(),
+                ViewMode::Exceptions => app.select_previous_exception(),
+                _ => {}
+            }
+        }
+        KeyCode::Down => {
+            match app.view_mode {
+                ViewMode::Logs => app.scroll_down(),
+                ViewMode::QueryAnalysis => app.select_next_request(),
+                ViewMode::Exceptions => app.select_next_exception(),
+                _ => {}
+            }
+        }
+        KeyCode::PageUp => {
+            if matches!(app.view_mode, ViewMode::Logs) {
+                app.scroll_page_up(10);
+            }
+        }
+        KeyCode::PageDown => {
+            if matches!(app.view_mode, ViewMode::Logs) {
+                app.scroll_page_down(10);
+            }
+        }
+        KeyCode::Enter => {
+            if matches!(app.view_mode, ViewMode::QueryAnalysis) {
+                app.view_selected_request();
+            }
+        }
+        KeyCode::Char('e') => {
+            // Export logs
+            if matches!(app.view_mode, ViewMode::Logs) {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let filename = format!("caboose_logs_{}.txt", timestamp);
+                let _ = app.export_logs(&filename);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn process_name_color(name: &str) -> Color {
+    // Simple hash-based color assignment
+    let colors = [
+        Color::Cyan,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+    ];
+    let hash: usize = name.bytes().map(|b| b as usize).sum();
+    colors[hash % colors.len()]
+}
+
+// ============================================================================
+// UI POLISH UTILITIES
+// ============================================================================
+
+/// Enhanced color palette for better visual hierarchy
+mod colors {
+    use ratatui::style::Color;
+
+    // Primary colors
+    pub const PRIMARY: Color = Color::Cyan;
+    pub const SUCCESS: Color = Color::Green;
+    pub const WARNING: Color = Color::Yellow;
+    pub const DANGER: Color = Color::Red;
+    pub const INFO: Color = Color::Blue;
+
+    // Status colors with gradients
+    pub const SUCCESS_BRIGHT: Color = Color::LightGreen;
+    pub const WARNING_BRIGHT: Color = Color::LightYellow;
+    pub const DANGER_BRIGHT: Color = Color::LightRed;
+
+    // Neutral colors
+    pub const TEXT_PRIMARY: Color = Color::White;
+    pub const TEXT_SECONDARY: Color = Color::Gray;
+    pub const TEXT_MUTED: Color = Color::DarkGray;
+
+    // Background colors
+    pub const BG_HIGHLIGHT: Color = Color::DarkGray;
+    pub const BG_SELECTED: Color = Color::Rgb(40, 40, 60);
+
+    // Database health gradient
+    pub fn health_color(score: u8) -> Color {
+        match score {
+            90..=100 => Color::LightGreen,
+            80..=89 => Color::Green,
+            70..=79 => Color::Yellow,
+            60..=69 => Color::LightYellow,
+            40..=59 => Color::LightRed,
+            _ => Color::Red,
+        }
+    }
+
+    // Duration-based color
+    pub fn duration_color(ms: f64) -> Color {
+        match ms as u64 {
+            0..=50 => Color::Green,
+            51..=100 => Color::Yellow,
+            101..=200 => Color::LightRed,
+            _ => Color::Red,
+        }
+    }
+}
+
+/// Format numbers with thousands separators
+fn format_number(n: usize) -> String {
+    n.to_string()
+        .as_bytes()
+        .rchunks(3)
+        .rev()
+        .map(std::str::from_utf8)
+        .collect::<Result<Vec<&str>, _>>()
+        .unwrap()
+        .join(",")
+}
+
+/// Format duration in a human-readable way
+fn format_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{}s", seconds)
+    } else if seconds < 3600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+    }
+}
+
+/// Format milliseconds nicely
+fn format_ms(ms: f64) -> String {
+    if ms < 1.0 {
+        format!("{:.2}ms", ms)
+    } else if ms < 1000.0 {
+        format!("{:.1}ms", ms)
+    } else {
+        format!("{:.2}s", ms / 1000.0)
+    }
+}
+
+/// Format percentage with color
+fn format_percentage(value: f64) -> String {
+    format!("{:.1}%", value)
+}
+
+/// Create a horizontal gauge/progress bar
+fn create_gauge(percentage: f64, width: usize) -> String {
+    let filled = ((percentage / 100.0) * width as f64) as usize;
+    let empty = width.saturating_sub(filled);
+    format!("{}{}",
+        "█".repeat(filled),
+        "░".repeat(empty)
+    )
+}
+
+/// Create a vertical bar for sparkline-style visualization
+fn create_bar_chart(value: f64, max_value: f64, height: usize) -> Vec<String> {
+    let filled_height = ((value / max_value) * height as f64).ceil() as usize;
+    let mut bars = Vec::new();
+
+    for i in 0..height {
+        if height - i <= filled_height {
+            bars.push("█".to_string());
+        } else {
+            bars.push(" ".to_string());
+        }
+    }
+
+    bars
+}
+
+/// Create a simple sparkline
+fn create_sparkline(values: &[f64]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+
+    let chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let max = values.iter().fold(0.0f64, |a, &b| a.max(b));
+
+    if max == 0.0 {
+        return chars[0].to_string().repeat(values.len());
+    }
+
+    values.iter()
+        .map(|&v| {
+            let index = ((v / max) * (chars.len() - 1) as f64) as usize;
+            chars[index.min(chars.len() - 1)]
+        })
+        .collect()
+}
+
+/// Create a scroll indicator
+fn create_scroll_indicator(current: usize, total: usize, visible: usize) -> String {
+    if total <= visible {
+        return String::new();
+    }
+
+    let percentage = (current as f64 / total.saturating_sub(visible) as f64 * 100.0).min(100.0);
+    format!(" {}%", percentage as usize)
+}
+
+/// Create bordered section separator
+fn create_separator(title: &str, width: usize) -> String {
+    let title_len = title.len();
+    if title_len + 4 >= width {
+        return title.to_string();
+    }
+
+    let remaining = width - title_len - 4;
+    let left = remaining / 2;
+    let right = remaining - left;
+
+    format!("{}[ {} ]{}", "─".repeat(left), title, "─".repeat(right))
+}

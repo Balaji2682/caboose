@@ -1,0 +1,75 @@
+# Caboose Configuration File
+# Copy this to .caboose.toml in your project root and customize
+
+[frontend]
+# Explicit path to frontend directory (overrides auto-detection)
+# Useful when your frontend is in a non-standard location
+# path = "client"
+# path = "apps/web"
+# path = "../my-react-app"
+
+# Disable frontend auto-detection
+# Set to true if you want to manually specify everything via Procfile
+# disable_auto_detect = false
+
+# Custom dev command (overrides framework default)
+# Use this to add custom flags or use a different command
+# dev_command = "npm run dev -- --port 5173 --host"
+# dev_command = "yarn dev"
+# dev_command = "pnpm dev --open"
+
+# Custom port (overrides framework default)
+# port = 5173
+
+# Custom process name in logs (default: "frontend")
+# Useful for clarity when running multiple frontends
+# process_name = "ui"
+# process_name = "admin-dashboard"
+
+[rails]
+# Rails server port (default: 3000)
+# port = 4000
+
+# Disable Rails auto-detection
+# Set to true if you're not using Rails or want manual control
+# disable_auto_detect = false
+
+# Process-specific overrides
+# Use these to override commands for specific processes
+
+# [processes.web]
+# command = "bundle exec puma -p 4000"
+# env = { RAILS_ENV = "development", RAILS_LOG_LEVEL = "debug" }
+
+# [processes.frontend]
+# command = "cd client && pnpm dev --port 3001"
+# env = { NODE_ENV = "development", VITE_API_URL = "http://localhost:4000" }
+
+# [processes.worker]
+# command = "bundle exec sidekiq -C config/sidekiq.yml"
+# env = { RAILS_ENV = "development" }
+
+# ===== EXAMPLE CONFIGURATIONS =====
+
+# Example 1: Custom frontend location
+# [frontend]
+# path = "apps/web"
+# process_name = "web-ui"
+
+# Example 2: Multiple frontends (use Procfile for this)
+# Create a Procfile with:
+#   admin: cd admin-ui && npm run dev
+#   customer: cd customer-app && npm run dev
+
+# Example 3: Custom ports
+# [rails]
+# port = 4000
+#
+# [frontend]
+# port = 3001
+
+# Example 4: Disable auto-detection
+# [frontend]
+# disable_auto_detect = true
+#
+# Then create a custom Procfile with your exact processes
