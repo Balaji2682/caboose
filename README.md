@@ -18,11 +18,25 @@ cargo build --release
 ./target/release/caboose
 ```
 
-## Documentation
+## Install from GitHub Release (Linux)
 
-- **Commands**: See [COMMANDS.md](COMMANDS.md) for command palette guide
-- **Themes**: See [THEMES.md](THEMES.md) for color theme options
-- **Icons**: See [ICONS.md](ICONS.md) for icon configuration
+Every merge to `main` publishes a Linux build to GitHub Releases.
+
+```bash
+# Download the latest Linux binary
+curl -LO https://github.com/Balaji2682/caboose/releases/latest/download/caboose-linux-x86_64.tar.gz
+
+# (Optional) verify checksum
+curl -LO https://github.com/Balaji2682/caboose/releases/latest/download/caboose-linux-x86_64.tar.gz.sha256
+sha256sum -c caboose-linux-x86_64.tar.gz.sha256
+
+# Install into your PATH
+tar -xzf caboose-linux-x86_64.tar.gz
+sudo install caboose /usr/local/bin/caboose
+caboose
+```
+
+## Documentation
 - **API Docs**: Run `cargo doc --no-deps --open`
 
 ## Customization
