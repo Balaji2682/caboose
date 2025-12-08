@@ -256,18 +256,21 @@ async fn run_dev_mode() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Load or generate Procfile
-    let procfile = if std::path::Path::new("Procfile").exists() {
+    let mut procfile = if std::path::Path::new("Procfile").exists() {
         println!("Loading Procfile...");
         Procfile::parse("Procfile")
             .map_err(|e| format!("Failed to load Procfile: {}", e))?
     } else if rails_app.detected || frontend_app.detected {
         println!("No Procfile found, auto-generating...");
-        let procfile_content = generate_multi_project_procfile(&rails_app, &frontend_app);
+        let procfile_content = generate_multi_project_procfile(&rails_app, &frontend_app, &caboose_config);
         println!("{}", procfile_content);
         Procfile::parse_content(&procfile_content)?
     } else {
         return Err("No Procfile found and no Rails/Frontend app detected. Create a Procfile to continue.".into());
     };
+
+    // Apply process-specific overrides from .caboose.toml
+    apply_process_overrides(&mut procfile, &caboose_config);
 
     println!("Starting {} processes", procfile.processes.len());
 
@@ -316,10 +319,19 @@ async fn run_dev_mode() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn processes
     for proc_config in procfile.processes {
         println!("  → Starting: {}", proc_config.name);
+
+        // Merge global env vars with process-specific env vars from config
+        let mut process_env = env_vars.clone();
+        if let Some(override_config) = caboose_config.processes.get(&proc_config.name) {
+            for (key, value) in &override_config.env {
+                process_env.insert(key.clone(), value.clone());
+            }
+        }
+
         process_manager.spawn_process(
             proc_config.name.clone(),
             proc_config.command.clone(),
-            env_vars.clone(),
+            process_env,
         )?;
     }
 
@@ -358,21 +370,42 @@ async fn run_dev_mode() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn generate_multi_project_procfile(rails_app: &RailsApp, frontend_app: &FrontendApp) -> String {
+fn apply_process_overrides(procfile: &mut Procfile, config: &CabooseConfig) {
+    // Apply process-specific command overrides from [processes.xxx] sections
+    for process in &mut procfile.processes {
+        if let Some(override_config) = config.processes.get(&process.name) {
+            if let Some(ref custom_command) = override_config.command {
+                println!("  Overriding '{}' command from .caboose.toml", process.name);
+                process.command = custom_command.clone();
+            }
+        }
+    }
+}
+
+fn generate_multi_project_procfile(
+    rails_app: &RailsApp,
+    frontend_app: &FrontendApp,
+    config: &CabooseConfig,
+) -> String {
     let mut procfile_content = String::new();
 
-    // Add Rails processes if detected
+    // Add Rails processes if detected (with port override from config)
     if rails_app.detected {
-        procfile_content.push_str(&rails_app.generate_procfile());
+        procfile_content.push_str(&rails_app.generate_procfile(config.rails.port));
     }
 
-    // Add frontend process if detected
+    // Add frontend process if detected (with dev_command override from config)
     if frontend_app.detected {
-        if let Some(frontend_entry) = frontend_app.generate_procfile_entry() {
+        if let Some(frontend_entry) = frontend_app.generate_procfile_entry(
+            config.frontend.dev_command.as_deref()
+        ) {
             if !procfile_content.is_empty() {
                 procfile_content.push('\n');
             }
-            procfile_content.push_str(&format!("frontend: {}", frontend_entry));
+
+            // Use custom process name if configured
+            let process_name = config.frontend.process_name.as_deref().unwrap_or("frontend");
+            procfile_content.push_str(&format!("{}: {}", process_name, frontend_entry));
         }
     }
 

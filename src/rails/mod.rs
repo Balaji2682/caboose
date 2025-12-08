@@ -67,11 +67,12 @@ impl RailsApp {
         app
     }
 
-    pub fn generate_procfile(&self) -> String {
+    pub fn generate_procfile(&self, port_override: Option<u16>) -> String {
         let mut procfile = String::new();
 
-        // Web server
-        procfile.push_str("web: bundle exec rails server -p 3000\n");
+        // Web server with configurable port
+        let port = port_override.unwrap_or(3000);
+        procfile.push_str(&format!("web: bundle exec rails server -p {}\n", port));
 
         // Background job worker
         if let Some(ref job_framework) = self.background_job {

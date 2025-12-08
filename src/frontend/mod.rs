@@ -220,21 +220,28 @@ impl FrontendApp {
         None
     }
 
-    pub fn generate_procfile_entry(&self) -> Option<String> {
+    pub fn generate_procfile_entry(&self, dev_command_override: Option<&str>) -> Option<String> {
         if !self.detected {
             return None;
         }
 
-        let framework = self.framework.as_ref()?;
-        let pm = self.package_manager.run_command();
+        // Use custom dev_command from config if provided
+        let command = if let Some(custom_cmd) = dev_command_override {
+            custom_cmd.to_string()
+        } else {
+            let framework = self.framework.as_ref()?;
+            let pm = self.package_manager.run_command();
 
-        // Get the base command
-        let mut command = framework.dev_command();
+            // Get the base command
+            let mut command = framework.dev_command();
 
-        // Replace npm with actual package manager
-        if command.starts_with("npm ") {
-            command = command.replace("npm", pm);
-        }
+            // Replace npm with actual package manager
+            if command.starts_with("npm ") {
+                command = command.replace("npm", pm);
+            }
+
+            command
+        };
 
         // Change to frontend directory and run command
         Some(format!("cd {} && {}", self.path, command))
