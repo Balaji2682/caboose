@@ -4,7 +4,9 @@ use std::time::Duration;
 /// Format numbers with thousands separators
 ///
 /// # Examples
-/// ```
+/// ```rust
+/// use caboose::ui::formatting::format_number;
+///
 /// assert_eq!(format_number(1234), "1,234");
 /// assert_eq!(format_number(1000000), "1,000,000");
 /// ```
@@ -22,7 +24,9 @@ pub fn format_number(n: usize) -> String {
 /// Format duration in seconds to human-readable format
 ///
 /// # Examples
-/// ```
+/// ```rust
+/// use caboose::ui::formatting::format_duration;
+///
 /// assert_eq!(format_duration(45), "45s");
 /// assert_eq!(format_duration(90), "1m 30s");
 /// assert_eq!(format_duration(3700), "1h 1m");
@@ -40,7 +44,9 @@ pub fn format_duration(seconds: u64) -> String {
 /// Format milliseconds with appropriate precision
 ///
 /// # Examples
-/// ```
+/// ```rust
+/// use caboose::ui::formatting::format_ms;
+///
 /// assert_eq!(format_ms(0.5), "0.50ms");
 /// assert_eq!(format_ms(45.2), "45.2ms");
 /// assert_eq!(format_ms(1250.0), "1.25s");

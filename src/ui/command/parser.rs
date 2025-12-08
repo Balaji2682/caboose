@@ -65,7 +65,7 @@ impl CommandParser {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```text
     /// "search error logs" -> ["search", "error", "logs"]
     /// "export \"my file.txt\"" -> ["export", "my file.txt"]
     /// "filter 'process name'" -> ["filter", "process name"]

@@ -12,6 +12,8 @@ pub type CommandResult = Result<String, String>;
 /// # Example
 ///
 /// ```rust
+/// use caboose::ui::command::{Command, CommandContext, CommandResult};
+///
 /// struct QuitCommand;
 ///
 /// impl Command for QuitCommand {
