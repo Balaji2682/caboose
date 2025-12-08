@@ -1,10 +1,11 @@
 use ratatui::{
     layout::Rect,
-    widgets::{Block, Borders, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
 use crate::context::RequestContextTracker;
+use crate::ui::theme::Theme;
 
 pub fn render(
     f: &mut Frame,
@@ -19,9 +20,7 @@ pub fn render(
         format!("Detected N+1 issues: {}", n_plus_ones.len()),
     ];
 
-    let block = Block::default()
-        .title("Query Analysis")
-        .borders(Borders::ALL);
+    let block = Theme::block("Query Analysis");
     let para = Paragraph::new(text.join("\n")).block(block);
     f.render_widget(para, area);
 }

@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod context;
 pub mod database;
+pub mod environment;
 pub mod exception;
 pub mod explain;
 pub mod frontend;

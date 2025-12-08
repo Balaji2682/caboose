@@ -1,11 +1,12 @@
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
-    widgets::{Block, Borders, Cell, Row, Table},
+    widgets::{Cell, Row, Table},
     Frame,
 };
 
 use crate::exception::ExceptionTracker;
+use crate::ui::theme::Theme;
 
 pub fn render(f: &mut Frame, area: Rect, exception_tracker: &ExceptionTracker) {
     let stats = exception_tracker.get_stats();
@@ -38,11 +39,7 @@ pub fn render(f: &mut Frame, area: Rect, exception_tracker: &ExceptionTracker) {
         ],
     )
     .header(header)
-    .block(
-        Block::default()
-            .title(format!("Exceptions ({})", stats.total_exceptions))
-            .borders(Borders::ALL),
-    );
+    .block(Theme::block(format!("Exceptions ({})", stats.total_exceptions)));
 
     f.render_widget(table, area);
 }

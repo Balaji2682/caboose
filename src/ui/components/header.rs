@@ -133,7 +133,7 @@ mod tests {
     #[test]
     fn test_header_builder() {
         let header = HeaderBuilder::new("Test Dashboard")
-            .icon(Icons::DATABASE)
+            .icon(Icons::database())
             .build();
 
         assert!(!header.is_empty());

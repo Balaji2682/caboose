@@ -5,10 +5,13 @@
 
 // Public modules
 pub mod theme;
+pub mod themes;
+pub mod icon_manager;
 pub mod formatting;
 pub mod widgets;
 pub mod components;
 pub mod views;
+pub mod command;
 
 // Re-exports for convenience
 pub use theme::Theme;
@@ -111,6 +114,7 @@ pub struct App {
 
     // Data trackers
     _git_info: GitInfo,
+    environment_info: crate::environment::EnvironmentInfo,
     stats_collector: StatsCollector,
     context_tracker: std::sync::Arc<RequestContextTracker>,
     db_health: std::sync::Arc<DatabaseHealth>,
@@ -126,6 +130,16 @@ pub struct App {
     selected_request: usize,
     selected_exception: usize,
     filter_process: Option<String>,
+
+    // Command system
+    command_mode: bool,
+    command_input: String,
+    command_registry: command::CommandRegistry,
+    command_autocomplete: command::AutocompleteEngine,
+    command_history: command::CommandHistory,
+    command_suggestions: Vec<command::autocomplete::Suggestion>,
+    selected_suggestion: usize,
+    last_command_result: Option<command::ExecutionResult>,
 }
 
 impl App {
@@ -138,12 +152,18 @@ impl App {
         test_tracker: std::sync::Arc<TestTracker>,
         exception_tracker: std::sync::Arc<ExceptionTracker>,
     ) -> Self {
+        // Build command registry
+        let command_registry = command::commands::build_command_registry();
+        let command_metadata = command_registry.get_metadata().to_vec();
+        let command_autocomplete = command::AutocompleteEngine::new(command_metadata);
+
         Self {
             processes: Vec::new(),
             logs: Vec::new(),
             max_logs: 1000,
             should_quit: false,
             _git_info: git_info,
+            environment_info: crate::environment::EnvironmentInfo::detect(),
             stats_collector,
             context_tracker,
             db_health,
@@ -159,6 +179,14 @@ impl App {
             selected_request: 0,
             selected_exception: 0,
             filter_process: None,
+            command_mode: false,
+            command_input: String::new(),
+            command_registry,
+            command_autocomplete,
+            command_history: command::CommandHistory::new(100),
+            command_suggestions: Vec::new(),
+            selected_suggestion: 0,
+            last_command_result: None,
         }
     }
 
@@ -233,6 +261,124 @@ impl App {
 
     pub fn remove_search_char(&mut self) {
         self.search_query.pop();
+    }
+
+    // ========================================================================
+    // COMMAND MODE
+    // ========================================================================
+
+    pub fn enter_command_mode(&mut self) {
+        self.command_mode = true;
+        self.command_input = "/".to_string(); // Start with / prefix
+        self.command_suggestions.clear();
+        self.selected_suggestion = 0;
+        self.last_command_result = None;
+        self.update_command_suggestions(); // Show all commands initially
+    }
+
+    pub fn exit_command_mode(&mut self) {
+        self.command_mode = false;
+        self.command_input.clear();
+        self.command_suggestions.clear();
+        self.selected_suggestion = 0;
+    }
+
+    pub fn add_command_char(&mut self, c: char) {
+        self.command_input.push(c);
+        self.update_command_suggestions();
+        self.selected_suggestion = 0;
+    }
+
+    pub fn remove_command_char(&mut self) {
+        // Don't allow deleting the "/" prefix
+        if self.command_input.len() > 1 {
+            self.command_input.pop();
+            self.update_command_suggestions();
+            self.selected_suggestion = 0;
+        }
+    }
+
+    pub fn update_command_suggestions(&mut self) {
+        let partial = command::CommandParser::extract_partial_command(&self.command_input);
+        self.command_suggestions = self.command_autocomplete.get_suggestions(&partial, 5);
+    }
+
+    pub fn select_next_suggestion(&mut self) {
+        if !self.command_suggestions.is_empty() {
+            self.selected_suggestion = (self.selected_suggestion + 1) % self.command_suggestions.len();
+        }
+    }
+
+    pub fn select_prev_suggestion(&mut self) {
+        if !self.command_suggestions.is_empty() {
+            self.selected_suggestion = if self.selected_suggestion == 0 {
+                self.command_suggestions.len() - 1
+            } else {
+                self.selected_suggestion - 1
+            };
+        }
+    }
+
+    pub fn autocomplete_selected(&mut self) {
+        if let Some(suggestion) = self.command_suggestions.get(self.selected_suggestion) {
+            self.command_input = format!("/{}", suggestion.text);
+            self.update_command_suggestions();
+        }
+    }
+
+    pub fn navigate_command_history_prev(&mut self) {
+        if let Some(cmd) = self.command_history.prev(&self.command_input) {
+            self.command_input = cmd;
+            self.update_command_suggestions();
+        }
+    }
+
+    pub fn navigate_command_history_next(&mut self) {
+        if let Some(cmd) = self.command_history.next() {
+            self.command_input = cmd;
+            self.update_command_suggestions();
+        }
+    }
+
+    pub fn execute_command(&mut self) {
+        if self.command_input.trim() == "/" || self.command_input.trim().is_empty() {
+            self.exit_command_mode();
+            return;
+        }
+
+        // Parse command
+        let parsed = command::CommandParser::parse(&self.command_input);
+
+        // Add to history
+        self.command_history.add(self.command_input.clone());
+
+        // Create context
+        let mut ctx = command::commands::AppContext {
+            view_mode: &mut self.view_mode,
+            search_query: &mut self.search_query,
+            filter_process: &mut self.filter_process,
+            auto_scroll: &mut self.auto_scroll,
+            should_quit: &mut self.should_quit,
+            logs: &self.logs,
+        };
+
+        // Execute command
+        let result = self.command_registry.execute(&parsed.name, parsed.args, &mut ctx);
+
+        // Store result and handle based on success/failure
+        match result {
+            Ok(msg) => {
+                self.last_command_result = Some(command::ExecutionResult::Success(msg));
+                // Exit command mode on success
+                self.exit_command_mode();
+            }
+            Err(err) => {
+                self.last_command_result = Some(command::ExecutionResult::Error(err));
+                // Stay in command mode on error, clear input to try again
+                self.command_input = "/".to_string();
+                self.update_command_suggestions();
+            }
+        }
     }
 
     // ========================================================================
@@ -444,7 +590,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
 
         .constraints([
 
-            Constraint::Length(3), // For header
+            Constraint::Length(4), // For header (with environment info)
 
             Constraint::Length(3), // For tabs
 
@@ -458,7 +604,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
 
 
 
-    render_header(f, chunks[0], &app._git_info, &app.stats_collector);
+    render_header(f, chunks[0], &app._git_info, &app.environment_info, &app.stats_collector, &app.test_tracker);
 
 
 
@@ -570,6 +716,51 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
 
     render_footer(f, chunks[3], app.search_mode);
 
+    // Render command palette overlay if in command mode
+    if app.command_mode {
+        let palette_area = components::command_palette::calculate_palette_area(f.area());
+
+        // Get error message if in command mode with error
+        let error_msg = if let Some(ref result) = app.last_command_result {
+            if !result.is_success() {
+                result.message()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        components::command_palette::render_command_palette(
+            f,
+            palette_area,
+            &app.command_input,
+            &app.command_suggestions,
+            app.selected_suggestion,
+            error_msg,
+        );
+    } else if let Some(ref result) = app.last_command_result {
+        // Only show success messages after command mode exits
+        if result.is_success() {
+            if let Some(message) = result.message() {
+                let result_area = Layout::default()
+                    .direction(ratatui::layout::Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(0),
+                        Constraint::Length(3),
+                    ])
+                    .split(f.area())[1];
+
+                components::command_palette::render_command_result(
+                    f,
+                    result_area,
+                    message,
+                    false,
+                );
+            }
+        }
+    }
+
 }
 
 
@@ -582,7 +773,11 @@ fn render_header(
 
     git_info: &GitInfo,
 
+    environment_info: &crate::environment::EnvironmentInfo,
+
     stats_collector: &StatsCollector,
+
+    test_tracker: &std::sync::Arc<crate::test::TestTracker>,
 
 ) {
 
@@ -592,13 +787,37 @@ fn render_header(
 
     let avg_time = stats.avg_response_time();
 
+    // Environment segments (Powerlevel10k style)
+    let env_segments = environment_info.format_segment();
+    let env_line = Line::from(
+        env_segments
+            .iter()
+            .enumerate()
+            .flat_map(|(i, segment)| {
+                let mut spans = Vec::new();
+
+                if i > 0 {
+                    spans.push(Span::styled(" │ ", Style::default().fg(Theme::text_muted())));
+                }
+
+                spans.push(Span::styled(
+                    segment,
+                    Style::default().fg(Theme::text_secondary()),
+                ));
+
+                spans
+            })
+            .collect::<Vec<_>>()
+    );
 
 
-    let git_line = Line::from(vec![
+
+    // Build git line with optional debugger indicator
+    let mut git_spans = vec![
 
         Span::styled(" ", Style::default()),
 
-        Span::styled(Icons::GIT, Style::default().fg(Theme::INFO)),
+        Span::styled(Icons::git(), Style::default().fg(Theme::INFO)),
 
         Span::raw(" "),
 
@@ -614,7 +833,36 @@ fn render_header(
 
         ),
 
-    ]);
+    ];
+
+    // Add debugger indicator if active
+    if test_tracker.is_debugger_active() {
+        git_spans.push(Span::raw("   │   "));
+
+        if let Some(info) = test_tracker.get_debugger_info() {
+            let debugger_text = format!(
+                "⚡ {:?} @ {}:{}",
+                info.debugger_type,
+                info.file_path.as_deref().unwrap_or("unknown"),
+                info.line_number.map(|n| n.to_string()).unwrap_or_else(|| "?".to_string())
+            );
+            git_spans.push(Span::styled(
+                debugger_text,
+                Style::default()
+                    .fg(ratatui::style::Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            git_spans.push(Span::styled(
+                "⚡ Debugger Active",
+                Style::default()
+                    .fg(ratatui::style::Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+
+    let git_line = Line::from(git_spans);
 
 
 
@@ -622,7 +870,7 @@ fn render_header(
 
         Span::styled(
 
-            format!("   {} ", Icons::SUCCESS),
+            format!("   {} ", Icons::success()),
 
             Style::default().fg(Theme::SUCCESS),
 
@@ -644,7 +892,7 @@ fn render_header(
 
         Span::raw("   │   "),
 
-        Span::styled(Icons::INFO, Style::default().fg(Theme::WARNING)),
+        Span::styled(Icons::info(), Style::default().fg(Theme::WARNING)),
 
         Span::raw(" "),
 
@@ -668,11 +916,11 @@ fn render_header(
 
             if error_rate > 5.0 {
 
-                Icons::ERROR
+                Icons::error()
 
             } else {
 
-                Icons::SUCCESS
+                Icons::success()
 
             },
 
@@ -716,7 +964,7 @@ fn render_header(
 
         Span::styled(
 
-            format!("{} ", Icons::DATABASE),
+            format!("{} ", Icons::database()),
 
             Style::default().fg(Theme::INFO),
 
@@ -740,7 +988,7 @@ fn render_header(
 
 
 
-    let header = Paragraph::new(vec![git_line, stats_line]).block(
+    let header = Paragraph::new(vec![env_line, git_line, stats_line]).block(
 
         Block::default()
 
@@ -788,15 +1036,17 @@ fn render_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, search_mod
 
         FooterBuilder::new()
 
-            .add_binding(format!("{} Quit", Icons::QUIT), "")
+            .add_binding("q", "Quit")
 
-            .add_binding(format!("{} Toggle", Icons::TOGGLE), "")
+            .add_binding(":", "Command")
 
-            .add_binding(format!("{} Search", Icons::SEARCH), "")
+            .add_binding("t", "Toggle")
 
-            .add_binding(format!("{} Scroll", Icons::SCROLL), "")
+            .add_binding("/", "Search")
 
-            .add_binding(format!("{} Clear", Icons::CLEAR), "")
+            .add_binding("↑↓", "Scroll")
+
+            .add_binding("c", "Clear")
 
             .build()
 
@@ -829,6 +1079,49 @@ fn render_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, search_mod
 // ============================================================================
 
 fn handle_key_event(app: &mut App, key: KeyEvent) {
+    // Clear success messages on any key press
+    if let Some(ref result) = app.last_command_result {
+        if result.is_success() && !app.command_mode {
+            app.last_command_result = None;
+        }
+    }
+
+    // Handle command mode first
+    if app.command_mode {
+        // Clear error messages on typing in command mode
+        if app.last_command_result.is_some() && matches!(key.code, KeyCode::Char(_)) {
+            app.last_command_result = None;
+        }
+
+        match key.code {
+            KeyCode::Char(c) => app.add_command_char(c),
+            KeyCode::Backspace => app.remove_command_char(),
+            KeyCode::Esc => app.exit_command_mode(),
+            KeyCode::Enter => app.execute_command(),
+            KeyCode::Tab => app.autocomplete_selected(),
+            KeyCode::Down => {
+                if app.command_suggestions.is_empty() {
+                    // No suggestions - navigate history forward
+                    app.navigate_command_history_next();
+                } else {
+                    // Has suggestions - navigate suggestions
+                    app.select_next_suggestion();
+                }
+            }
+            KeyCode::Up => {
+                if app.command_suggestions.is_empty() {
+                    // No suggestions - navigate history backward
+                    app.navigate_command_history_prev();
+                } else {
+                    // Has suggestions - navigate suggestions
+                    app.select_prev_suggestion();
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     // Handle search mode separately
     if app.search_mode {
         match key.code {
@@ -851,12 +1144,14 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') => app.quit(),
         KeyCode::Esc => {
+            // Esc only navigates back, doesn't quit
             match app.view_mode {
                 ViewMode::RequestDetail(_) => app.view_mode = ViewMode::QueryAnalysis,
-                _ => app.quit(),
+                _ => {} // Do nothing in other views
             }
         }
         KeyCode::Char('t') => app.toggle_view(),
+        KeyCode::Char(':') => app.enter_command_mode(),
         KeyCode::Char('/') => {
             if matches!(app.view_mode, ViewMode::Logs) {
                 app.enter_search_mode();

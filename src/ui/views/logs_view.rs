@@ -45,9 +45,9 @@ fn render_processes(f: &mut Frame, area: ratatui::layout::Rect, processes: &[Pro
         .iter()
         .map(|p| {
             let (status_icon, status_color) = match p.status {
-                ProcessStatus::Running => (Icons::RUNNING, Theme::SUCCESS),
-                ProcessStatus::Stopped => (Icons::STOPPED, Theme::TEXT_MUTED),
-                ProcessStatus::Crashed => (Icons::ERROR, Theme::DANGER),
+                ProcessStatus::Running => (Icons::running(), Theme::SUCCESS),
+                ProcessStatus::Stopped => (Icons::stopped(), Theme::TEXT_MUTED),
+                ProcessStatus::Crashed => (Icons::error(), Theme::DANGER),
             };
 
             let uptime = p.start_time.map_or("--".to_string(), |start| {

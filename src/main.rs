@@ -28,8 +28,8 @@
 //! ./target/release/caboose
 //! ```
 //! - Coming soon CLI shims: `caboose dev [process]`, `caboose stop`, `caboose restart`, `caboose logs`, `caboose ps`.
-//! - Keyboard inside the TUI: `q`/`Esc` quit, `t` cycles views, `/` search,
-//!   `↑/↓` scroll, `PageUp/PageDown` page scroll, `c` clear filters, `e` export logs.
+//! - Keyboard inside the TUI: `q` quit, `t` cycles views, `/` search, `Esc` go back,
+//!   `↑/↓` scroll, `PageUp/PageDown` page scroll, `c` clear filters, `:` command mode.
 //!
 //! ## Configuration Priority
 //! 1) **Procfile** – full manual control.
@@ -210,6 +210,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_dev_mode() -> Result<(), Box<dyn std::error::Error>> {
+    // Detect terminal capabilities for icon rendering (must be first)
+    caboose::ui::icon_manager::IconManager::detect();
+
     // Load configuration
     let caboose_config = CabooseConfig::load();
 
