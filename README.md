@@ -49,8 +49,6 @@ Switch between 5 beautiful themes:
 
 Available: `material`, `solarized`, `dracula`, `nord`, `tokyo-night`
 
-See [THEMES.md](THEMES.md) for details.
-
 ### Icons
 By default, Caboose uses **ASCII icons** that work in any terminal:
 ```
