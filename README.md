@@ -43,4 +43,4 @@ By default, Caboose uses **ASCII icons** that work in any terminal:
 [✓] Success  [✗] Error  [!] Warning  [git] Git  [db] Database
 ```
 
-To enable Nerd Font icons, see [ICONS.md](ICONS.md).
+To enable Nerd Font icons install it.
