@@ -1,6 +1,6 @@
 # Caboose
 
-A modern terminal UI for Rails development with Material Design 3 styling and Claude CLI-inspired commands.
+A modern terminal UI for Rails development
 
 ## Features
 
