@@ -234,6 +234,48 @@ async fn run_dev_mode() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref assets) = rails_app.asset_pipeline {
             println!("  Assets: {}", assets);
         }
+
+        // Check Rails health (migrations, database connectivity)
+        println!("\nChecking Rails health...");
+        let health_issues = rails_app.check_health();
+        if health_issues.is_empty() {
+            println!("✓ No issues detected");
+        } else {
+            for issue in &health_issues {
+                match issue {
+                    caboose::rails::RailsHealthIssue::BundleOutdated(message) => {
+                        println!("\n❌ ERROR: Bundler dependencies not satisfied!");
+                        println!("   {}", message.lines().next().unwrap_or("Dependencies missing"));
+                        println!("   Run: bundle install");
+                        println!("\n   Caboose cannot start until dependencies are installed.");
+                    }
+                    caboose::rails::RailsHealthIssue::PendingMigrations(migrations) => {
+                        println!("\n⚠️  WARNING: {} pending migration(s) detected!", migrations.len());
+                        println!("   Run: bundle exec rails db:migrate");
+                        if migrations.len() <= 5 {
+                            for migration in migrations {
+                                println!("   - {}", migration);
+                            }
+                        }
+                    }
+                    caboose::rails::RailsHealthIssue::DatabaseNotCreated => {
+                        println!("\n❌ ERROR: Database does not exist!");
+                        println!("   Run: bundle exec rails db:create");
+                    }
+                    caboose::rails::RailsHealthIssue::DatabaseConnectionError(err) => {
+                        println!("\n❌ ERROR: Cannot connect to database!");
+                        println!("   {}", err);
+                        println!("   Check your database.yml configuration and ensure the database server is running.");
+                    }
+                }
+            }
+            println!();
+
+            // Exit if bundle install is needed
+            if health_issues.iter().any(|issue| matches!(issue, caboose::rails::RailsHealthIssue::BundleOutdated(_))) {
+                return Err("Please run 'bundle install' before starting Caboose".into());
+            }
+        }
     }
 
     // Detect Frontend application

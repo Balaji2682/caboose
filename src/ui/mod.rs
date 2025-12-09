@@ -27,6 +27,7 @@ use crate::stats::StatsCollector;
 use crate::test::TestTracker;
 use crate::ui::components::FooterBuilder;
 use crate::ui::theme::Icons;
+use crate::ui::widgets::Sparkline; // Import Sparkline
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
@@ -44,7 +45,7 @@ use ratatui::{
 };
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant}; // Import Instant
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
 
@@ -60,6 +61,7 @@ pub enum ViewMode {
     DatabaseHealth,
     TestResults,
     Exceptions,
+    ExceptionDetail(usize),
 }
 
 impl ViewMode {
@@ -71,6 +73,7 @@ impl ViewMode {
             ViewMode::DatabaseHealth => "Database Health",
             ViewMode::TestResults => "Test Results",
             ViewMode::Exceptions => "Exceptions",
+            ViewMode::ExceptionDetail(_) => "Exception Detail",
         }
     }
 
@@ -140,6 +143,13 @@ pub struct App {
     command_suggestions: Vec<command::autocomplete::Suggestion>,
     selected_suggestion: usize,
     last_command_result: Option<command::ExecutionResult>,
+
+    // Animation state
+    spinner_frame: usize,
+
+    // View transition state
+    previous_view_mode: Option<ViewMode>,
+    last_view_change_time: Option<Instant>,
 }
 
 impl App {
@@ -187,8 +197,12 @@ impl App {
             command_suggestions: Vec::new(),
             selected_suggestion: 0,
             last_command_result: None,
+            spinner_frame: 0,
+            previous_view_mode: None,
+            last_view_change_time: None,
         }
     }
+
 
     // ========================================================================
     // LOG MANAGEMENT
@@ -208,6 +222,20 @@ impl App {
                     if let Some(duration) = query.duration {
                         self.stats_collector.record_sql_query(duration);
                         self.db_health.analyze_query(&query.query, duration);
+                    }
+                }
+                LogEvent::RailsStartupError(rails_error) => {
+                    // Handle Rails errors - they're already logged, no additional action needed here
+                    // The error will appear in the logs view with appropriate highlighting
+                    use crate::parser::RailsError;
+                    match rails_error {
+                        RailsError::PendingMigrations => {
+                            // Could potentially auto-trigger migration dialog in future
+                        }
+                        RailsError::DatabaseNotFound(_) => {
+                            // Could show "Run db:create" suggestion
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -237,6 +265,11 @@ impl App {
         let variants = ViewMode::all_variants();
         let current_index = self.active_tab_index;
         let next_index = (current_index + 1) % variants.len();
+        
+        // Record previous view and time for transition
+        self.previous_view_mode = Some(self.view_mode.clone());
+        self.last_view_change_time = Some(Instant::now());
+
         self.view_mode = ViewMode::from_index(next_index).unwrap_or(ViewMode::Logs);
         self.active_tab_index = next_index;
     }
@@ -437,6 +470,10 @@ impl App {
         self.view_mode = ViewMode::RequestDetail(self.selected_request);
     }
 
+    pub fn view_selected_exception(&mut self) {
+        self.view_mode = ViewMode::ExceptionDetail(self.selected_exception);
+    }
+
     // ========================================================================
     // FILTERING
     // ========================================================================
@@ -545,6 +582,9 @@ pub async fn run_ui(
         let processes = process_manager.get_processes();
         app.update_processes(processes);
 
+        // Update animation frame
+        app.spinner_frame = app.spinner_frame.wrapping_add(1);
+
         // Draw UI using modular render function
         terminal.draw(|f| render_ui(f, &app))?;
 
@@ -583,138 +623,127 @@ pub async fn run_ui(
 /// Main rendering dispatcher
 
 fn render_ui(f: &mut ratatui::Frame, app: &App) {
+    let fade_progress = if let Some(last_change_time) = app.last_view_change_time {
+        let elapsed = last_change_time.elapsed();
+        let fade_duration = Duration::from_millis(200);
+        (elapsed.as_secs_f32() / fade_duration.as_secs_f32()).min(1.0)
+    } else {
+        1.0
+    };
 
     let chunks = Layout::default()
-
         .direction(ratatui::layout::Direction::Vertical)
-
         .constraints([
-
             Constraint::Length(4), // For header (with environment info)
-
             Constraint::Length(3), // For tabs
-
             Constraint::Min(0),    // For content
-
             Constraint::Length(1), // For footer
-
         ])
-
         .split(f.area());
 
-
-
-    render_header(f, chunks[0], &app._git_info, &app.environment_info, &app.stats_collector, &app.test_tracker);
-
-
+    render_header(f, chunks[0], &app._git_info, &app.environment_info, &app.stats_collector, &app.test_tracker, Some(fade_progress));
 
     let tab_titles: Vec<_> = ViewMode::all_variants()
-
         .iter()
-
         .map(|v| v.as_str())
-
         .collect();
 
-
-
     let tabs = Tabs::new(tab_titles)
-
         .block(
-
-            Block::default()
-
-                .borders(Borders::ALL)
-
-                .title("Caboose")
-
-                .style(Style::default().fg(Theme::TEXT_PRIMARY).bg(Theme::SURFACE)),
-
+            Theme::block("Caboose", None) // Using Theme::block with no fade
+                .style(Style::default().fg(Theme::text_primary()).bg(Theme::surface())),
         )
-
         .select(app.active_tab_index)
-
-        .style(Style::default().fg(Theme::TEXT_SECONDARY))
-
+        .style(Style::default().fg(Theme::text_secondary()))
         .highlight_style(
-
             Style::default()
-
-                .fg(Theme::PRIMARY)
-
+                .fg(Theme::primary())
                 .add_modifier(Modifier::BOLD),
-
         );
 
+        f.render_widget(tabs, chunks[1]);
 
+    
 
-    f.render_widget(tabs, chunks[1]);
+    
 
+    
 
+        match &app.view_mode {
 
-    match &app.view_mode {
+                ViewMode::Logs => {
 
-        ViewMode::Logs => {
+                    views::logs_view::render(
 
-            views::logs_view::render(
+                        f,
 
-                f,
+                        chunks[2],
 
-                chunks[2],
+                        &app.processes,
 
-                &app.processes,
+                        &app.logs,
 
-                &app.logs,
+                        app.search_mode,
 
-                app.search_mode,
+                        &app.search_query,
 
-                &app.search_query,
+                        app.log_scroll,
 
-                app.log_scroll,
+                        app.auto_scroll,
 
-                app.auto_scroll,
+                        &app.filter_process,
 
-                &app.filter_process,
+                        app.spinner_frame,
 
-            );
+                        Some(fade_progress),
 
-        }
+                    );
 
-        ViewMode::QueryAnalysis => {
+                }
 
-            views::query_analysis_view::render(f, chunks[2], &app.context_tracker);
+                ViewMode::QueryAnalysis => {
 
-        }
+                    views::query_analysis_view::render(f, chunks[2], &app.context_tracker, app.spinner_frame, Some(fade_progress));
 
-        ViewMode::RequestDetail(idx) => {
+                }
 
-            render_request_detail_view_fallback(f, chunks[2], app, *idx);
+                ViewMode::RequestDetail(idx) => {
 
-        }
+                    render_request_detail_view_fallback(f, chunks[2], app, *idx);
 
-        ViewMode::DatabaseHealth => {
+                }
 
-            views::database_health_view::render(f, chunks[2], &app.db_health);
+                ViewMode::DatabaseHealth => {
 
-        }
+                    views::database_health_view::render(f, chunks[2], &app.db_health, app.spinner_frame, Some(fade_progress));
 
-        ViewMode::TestResults => {
+                }
 
-            views::test_results_view::render(f, chunks[2], &app.test_tracker);
+                ViewMode::TestResults => {
 
-        }
+                    views::test_results_view::render(f, chunks[2], &app.test_tracker, app.spinner_frame, Some(fade_progress));
 
-        ViewMode::Exceptions => {
+                }
 
-            views::exceptions_view::render(f, chunks[2], &app.exception_tracker);
+                ViewMode::Exceptions => {
 
-        }
+                    views::exceptions_view::render(f, chunks[2], &app.exception_tracker, app.selected_exception, app.spinner_frame, Some(fade_progress));
+
+                }
+
+                ViewMode::ExceptionDetail(exception_index) => {
+
+                    views::exception_detail_view::render(f, chunks[2], &app.exception_tracker, *exception_index, Some(fade_progress));
+
+                }
+
+        
 
     }
 
 
 
-    render_footer(f, chunks[3], app.search_mode);
+    render_footer(f, chunks[3], app.search_mode, Some(fade_progress));
 
     // Render command palette overlay if in command mode
     if app.command_mode {
@@ -738,6 +767,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
             &app.command_suggestions,
             app.selected_suggestion,
             error_msg,
+            Some(fade_progress),
         );
     } else if let Some(ref result) = app.last_command_result {
         // Only show success messages after command mode exits
@@ -756,6 +786,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
                     result_area,
                     message,
                     false,
+                    Some(fade_progress),
                 );
             }
         }
@@ -779,6 +810,8 @@ fn render_header(
 
     test_tracker: &std::sync::Arc<crate::test::TestTracker>,
 
+    fade_progress: Option<f32>,
+
 ) {
 
     let stats = stats_collector.get_stats();
@@ -786,6 +819,45 @@ fn render_header(
     let error_rate = stats.error_rate();
 
     let avg_time = stats.avg_response_time();
+
+    let response_time_history = stats_collector.get_response_time_history();
+    // Convert u64 to f64 for Sparkline
+    let response_time_history_f64: Vec<f64> = response_time_history.iter().map(|&x| x as f64).collect();
+
+
+    // Define overall header layout
+    let _header_layout = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Environment line
+            Constraint::Length(1), // Git info line
+            Constraint::Length(1), // Stats line + Sparkline
+        ])
+        .split(area);
+
+
+    // Render Block around header content
+    let header_block = Block::default()
+        .title(Span::styled(
+            " Caboose ",
+            Style::default()
+                .fg(Theme::apply_fade_to_color(Theme::primary(), fade_progress.unwrap_or(1.0)))
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Theme::apply_fade_to_color(Theme::text_muted(), fade_progress.unwrap_or(1.0))));
+
+    // Compute inner area before rendering to avoid move
+    let inner_area = header_block.inner(area);
+    let inner_chunks = Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Environment line
+            Constraint::Length(1), // Git info line
+            Constraint::Length(1), // Stats line + Sparkline
+        ])
+        .split(inner_area);
+
 
     // Environment segments (Powerlevel10k style)
     let env_segments = environment_info.format_segment();
@@ -797,19 +869,19 @@ fn render_header(
                 let mut spans = Vec::new();
 
                 if i > 0 {
-                    spans.push(Span::styled(" │ ", Style::default().fg(Theme::text_muted())));
+                    spans.push(Span::styled(" │ ", Style::default().fg(Theme::apply_fade_to_color(Theme::text_muted(), fade_progress.unwrap_or(1.0)))));
                 }
 
                 spans.push(Span::styled(
                     segment,
-                    Style::default().fg(Theme::text_secondary()),
+                    Style::default().fg(Theme::apply_fade_to_color(Theme::text_secondary(), fade_progress.unwrap_or(1.0))),
                 ));
 
                 spans
             })
             .collect::<Vec<_>>()
     );
-
+    f.render_widget(Paragraph::new(env_line), inner_chunks[0]);
 
 
     // Build git line with optional debugger indicator
@@ -817,7 +889,7 @@ fn render_header(
 
         Span::styled(" ", Style::default()),
 
-        Span::styled(Icons::git(), Style::default().fg(Theme::INFO)),
+        Span::styled(Icons::git(), Style::default().fg(Theme::apply_fade_to_color(Theme::info(), fade_progress.unwrap_or(1.0)))),
 
         Span::raw(" "),
 
@@ -827,7 +899,7 @@ fn render_header(
 
             Style::default()
 
-                .fg(Theme::PRIMARY)
+                .fg(Theme::apply_fade_to_color(Theme::primary(), fade_progress.unwrap_or(1.0)))
 
                 .add_modifier(Modifier::BOLD),
 
@@ -849,176 +921,88 @@ fn render_header(
             git_spans.push(Span::styled(
                 debugger_text,
                 Style::default()
-                    .fg(ratatui::style::Color::Yellow)
+                    .fg(Theme::apply_fade_to_color(Theme::warning(), fade_progress.unwrap_or(1.0)))
                     .add_modifier(Modifier::BOLD),
             ));
         } else {
             git_spans.push(Span::styled(
                 "⚡ Debugger Active",
                 Style::default()
-                    .fg(ratatui::style::Color::Yellow)
+                    .fg(Theme::apply_fade_to_color(Theme::warning(), fade_progress.unwrap_or(1.0)))
                     .add_modifier(Modifier::BOLD),
             ));
         }
     }
 
     let git_line = Line::from(git_spans);
-
-
-
-    let stats_line = Line::from(vec![
-
-        Span::styled(
-
-            format!("   {} ", Icons::success()),
-
-            Style::default().fg(Theme::SUCCESS),
-
-        ),
-
-        Span::styled(
-
-            format_number(stats.total_requests),
-
-            Style::default()
-
-                .fg(Theme::TEXT_PRIMARY)
-
-                .add_modifier(Modifier::BOLD),
-
-        ),
-
-        Span::styled(" requests", Style::default().fg(Theme::TEXT_SECONDARY)),
-
-        Span::raw("   │   "),
-
-        Span::styled(Icons::info(), Style::default().fg(Theme::WARNING)),
-
-        Span::raw(" "),
-
-        Span::styled(
-
-            format_ms(avg_time),
-
-            Style::default()
-
-                .fg(Theme::WARNING)
-
-                .add_modifier(Modifier::BOLD),
-
-        ),
-
-        Span::styled(" avg", Style::default().fg(Theme::TEXT_SECONDARY)),
-
-        Span::raw("   │   "),
-
-        Span::styled(
-
-            if error_rate > 5.0 {
-
-                Icons::error()
-
-            } else {
-
-                Icons::success()
-
-            },
-
-            Style::default().fg(if error_rate > 5.0 {
-
-                Theme::DANGER
-
-            } else {
-
-                Theme::SUCCESS
-
-            }),
-
-        ),
-
-        Span::raw(" "),
-
-        Span::styled(
-
-            format_percentage(error_rate),
-
-            Style::default()
-
-                .fg(if error_rate > 5.0 {
-
-                    Theme::DANGER
-
-                } else {
-
-                    Theme::SUCCESS
-
-                })
-
-                .add_modifier(Modifier::BOLD),
-
-        ),
-
-        Span::styled(" errors", Style::default().fg(Theme::TEXT_SECONDARY)),
-
-        Span::raw("   │   "),
-
-        Span::styled(
-
-            format!("{} ", Icons::database()),
-
-            Style::default().fg(Theme::INFO),
-
-        ),
-
-        Span::styled(
-
-            format_number(stats.sql_queries),
-
-            Style::default()
-
-                .fg(Theme::INFO)
-
-                .add_modifier(Modifier::BOLD),
-
-        ),
-
-        Span::styled(" queries", Style::default().fg(Theme::TEXT_SECONDARY)),
-
-    ]);
-
-
-
-    let header = Paragraph::new(vec![env_line, git_line, stats_line]).block(
-
-        Block::default()
-
-            .title(Span::styled(
-
-                " Caboose ",
-
-                Style::default()
-
-                    .fg(Theme::PRIMARY)
-
-                    .add_modifier(Modifier::BOLD),
-
-            ))
-
-            .borders(Borders::ALL)
-
-            .border_style(Style::default().fg(Theme::TEXT_MUTED)),
-
+    f.render_widget(Paragraph::new(git_line), inner_chunks[1]);
+
+
+    // Stats line and Sparkline
+    let stats_layout = Layout::default()
+        .direction(ratatui::layout::Direction::Horizontal)
+        .constraints([
+            Constraint::Length(18), // total requests
+            Constraint::Length(15), // avg time
+            Constraint::Length(10), // sparkline
+            Constraint::Length(15), // error rate
+            Constraint::Min(0),     // sql queries (flexible)
+        ])
+        .split(inner_chunks[2]);
+
+
+    // Render total requests
+    let total_requests_span = Span::styled(
+        format!("   {} {} requests", Icons::success(), format_number(stats.total_requests)),
+        Style::default().fg(Theme::apply_fade_to_color(Theme::success(), fade_progress.unwrap_or(1.0))),
     );
+    f.render_widget(Paragraph::new(total_requests_span), stats_layout[0]);
+
+    // Render avg time
+    let avg_time_span = Span::styled(
+        format!("{} {} avg", Icons::info(), format_ms(avg_time)),
+        Style::default().fg(Theme::apply_fade_to_color(Theme::warning(), fade_progress.unwrap_or(1.0))),
+    );
+    f.render_widget(Paragraph::new(avg_time_span), stats_layout[1]);
 
 
+    // Render Sparkline as text
+    let sparkline = Sparkline::new(&response_time_history_f64);
+    let sparkline_span = Span::styled(
+        sparkline.render(),
+        Style::default().fg(Theme::apply_fade_to_color(Theme::warning(), fade_progress.unwrap_or(1.0)))
+    );
+    f.render_widget(Paragraph::new(sparkline_span), stats_layout[2]);
 
-    f.render_widget(header, area);
+
+    // Render error rate
+    let error_rate_text = format_percentage(error_rate);
+    let error_rate_color = if error_rate > 5.0 { Theme::danger() } else { Theme::success() };
+    let error_rate_span = Span::styled(
+        format!(" {} {} errors", if error_rate > 5.0 { Icons::error() } else { Icons::success() }, error_rate_text),
+        Style::default().fg(Theme::apply_fade_to_color(error_rate_color, fade_progress.unwrap_or(1.0))),
+    );
+    f.render_widget(Paragraph::new(error_rate_span), stats_layout[3]);
+
+
+    // Render sql queries
+    let sql_queries_span = Span::styled(
+        format!(" {} {} queries", Icons::database(), format_number(stats.sql_queries)),
+        Style::default().fg(Theme::apply_fade_to_color(Theme::info(), fade_progress.unwrap_or(1.0))),
+    );
+    f.render_widget(Paragraph::new(sql_queries_span), stats_layout[4]);
+
+    f.render_widget(header_block, area); // This line was missing
 
 }
 
 
 
-fn render_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, search_mode: bool) {
+
+
+
+
+fn render_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, search_mode: bool, fade_progress: Option<f32>) {
 
     let footer = if search_mode {
 
@@ -1058,9 +1042,9 @@ fn render_footer(f: &mut ratatui::Frame, area: ratatui::layout::Rect, search_mod
 
         Style::default()
 
-            .bg(Theme::SURFACE)
+            .bg(Theme::apply_fade_to_color(Theme::surface(), fade_progress.unwrap_or(1.0)))
 
-            .fg(Theme::TEXT_SECONDARY),
+            .fg(Theme::apply_fade_to_color(Theme::text_secondary(), fade_progress.unwrap_or(1.0))),
 
     );
 
@@ -1147,6 +1131,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
             // Esc only navigates back, doesn't quit
             match app.view_mode {
                 ViewMode::RequestDetail(_) => app.view_mode = ViewMode::QueryAnalysis,
+                ViewMode::ExceptionDetail(_) => app.view_mode = ViewMode::Exceptions,
                 _ => {} // Do nothing in other views
             }
         }
@@ -1182,8 +1167,10 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Enter => {
-            if matches!(app.view_mode, ViewMode::QueryAnalysis) {
-                app.view_selected_request();
+            match app.view_mode {
+                ViewMode::QueryAnalysis => app.view_selected_request(),
+                ViewMode::Exceptions => app.view_selected_exception(),
+                _ => {}
             }
         }
         KeyCode::Char('e') => {

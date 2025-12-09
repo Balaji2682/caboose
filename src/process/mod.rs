@@ -126,6 +126,11 @@ impl ProcessManager {
             cmd.arg(arg);
         }
 
+        // Set working directory to current directory
+        if let Ok(current_dir) = std::env::current_dir() {
+            cmd.cwd(current_dir);
+        }
+
         // Add environment variables
         for (key, value) in env_vars {
             cmd.env(key, value);
@@ -238,6 +243,12 @@ impl ProcessManager {
 
         let mut cmd = std::process::Command::new(parts[0]);
         cmd.args(&parts[1..]);
+
+        // Set working directory to current directory
+        if let Ok(current_dir) = std::env::current_dir() {
+            cmd.current_dir(current_dir);
+        }
+
         cmd.envs(env_vars);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());

@@ -12,6 +12,7 @@ pub enum ThemeName {
     Dracula,
     Nord,
     TokyoNight,
+    Catppuccin,
 }
 
 impl ThemeName {
@@ -22,6 +23,7 @@ impl ThemeName {
             ThemeName::Dracula => "dracula",
             ThemeName::Nord => "nord",
             ThemeName::TokyoNight => "tokyo-night",
+            ThemeName::Catppuccin => "catppuccin",
         }
     }
 
@@ -32,6 +34,7 @@ impl ThemeName {
             ThemeName::Dracula => "Dracula",
             ThemeName::Nord => "Nord",
             ThemeName::TokyoNight => "Tokyo Night",
+            ThemeName::Catppuccin => "Catppuccin",
         }
     }
 
@@ -42,6 +45,7 @@ impl ThemeName {
             "dracula" => Some(ThemeName::Dracula),
             "nord" => Some(ThemeName::Nord),
             "tokyo-night" | "tokyo" | "tokyonight" => Some(ThemeName::TokyoNight),
+            "catppuccin" | "cat" => Some(ThemeName::Catppuccin),
             _ => None,
         }
     }
@@ -53,6 +57,7 @@ impl ThemeName {
             ThemeName::Dracula,
             ThemeName::Nord,
             ThemeName::TokyoNight,
+            ThemeName::Catppuccin,
         ]
     }
 }
@@ -114,11 +119,11 @@ impl ColorPalette {
             secondary: Color::Rgb(211, 54, 130),  // Magenta
             background: Color::Rgb(0, 43, 54),    // Base03
             surface: Color::Rgb(7, 54, 66),       // Base02
-            text_primary: Color::Rgb(147, 161, 161), // Base0
+            text_primary: Color::Rgb(131, 148, 150), // Base0
             text_secondary: Color::Rgb(88, 110, 117), // Base01
             text_muted: Color::Rgb(101, 123, 131),   // Base00
             success: Color::Rgb(133, 153, 0),     // Green
-            success_bright: Color::Rgb(88, 110, 117), // Lighter green
+            success_bright: Color::Rgb(133, 153, 0), // Green (same as success)
             warning: Color::Rgb(181, 137, 0),     // Yellow
             danger: Color::Rgb(220, 50, 47),      // Red
             info: Color::Rgb(38, 139, 210),       // Blue
@@ -186,6 +191,26 @@ impl ColorPalette {
         }
     }
 
+    /// Catppuccin (Mocha) - Soothing dark theme for cozy coding
+    pub fn catppuccin() -> Self {
+        Self {
+            primary: Color::Rgb(137, 180, 250),   // Blue
+            primary_variant: Color::Rgb(116, 199, 236), // Sapphire
+            secondary: Color::Rgb(203, 166, 247), // Mauve
+            background: Color::Rgb(30, 30, 46),   // Base
+            surface: Color::Rgb(49, 50, 68),      // Surface0
+            text_primary: Color::Rgb(205, 214, 244), // Text
+            text_secondary: Color::Rgb(166, 173, 200), // Subtext0
+            text_muted: Color::Rgb(108, 112, 134),     // Overlay0
+            success: Color::Rgb(166, 227, 161),   // Green
+            success_bright: Color::Rgb(166, 227, 161), // Green
+            warning: Color::Rgb(249, 226, 175),   // Yellow
+            danger: Color::Rgb(243, 139, 168),    // Red
+            info: Color::Rgb(116, 199, 236),      // Sapphire
+            accent: Color::Rgb(250, 179, 135),    // Peach
+        }
+    }
+
     /// Get palette by theme name
     pub fn from_theme(theme: ThemeName) -> Self {
         match theme {
@@ -194,6 +219,7 @@ impl ColorPalette {
             ThemeName::Dracula => Self::dracula(),
             ThemeName::Nord => Self::nord(),
             ThemeName::TokyoNight => Self::tokyo_night(),
+            ThemeName::Catppuccin => Self::catppuccin(),
         }
     }
 }

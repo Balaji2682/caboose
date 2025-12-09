@@ -86,26 +86,6 @@ impl Theme {
     }
 
     // ============================================================================
-    // Legacy Constants (for backwards compatibility during migration)
-    // ============================================================================
-
-    // Will be removed after full migration to methods
-    pub const PRIMARY: Color = Color::Rgb(139, 92, 246);
-    pub const PRIMARY_VARIANT: Color = Color::Rgb(109, 40, 217);
-    pub const SECONDARY: Color = Color::Rgb(236, 72, 153);
-    pub const BACKGROUND: Color = Color::Rgb(17, 24, 39);
-    pub const SURFACE: Color = Color::Rgb(31, 41, 55);
-    pub const TEXT_PRIMARY: Color = Color::Rgb(243, 244, 246);
-    pub const TEXT_SECONDARY: Color = Color::Rgb(156, 163, 175);
-    pub const TEXT_MUTED: Color = Color::Rgb(75, 85, 99);
-    pub const SUCCESS: Color = Color::Rgb(16, 185, 129);
-    pub const SUCCESS_BRIGHT: Color = Color::Rgb(34, 197, 94);
-    pub const WARNING: Color = Color::Rgb(245, 158, 11);
-    pub const DANGER: Color = Color::Rgb(239, 68, 68);
-    pub const INFO: Color = Color::Rgb(59, 130, 246);
-    pub const ACCENT: Color = Color::Rgb(249, 115, 22);
-
-    // ============================================================================
     // Dynamic Color Helpers
     // ============================================================================
 
@@ -141,6 +121,29 @@ impl Theme {
         }
     }
 
+    /// Apply a fade effect to a color by blending it with the background.
+    /// progress 0.0 = full background, 1.0 = full color
+    pub fn apply_fade_to_color(color: Color, fade_progress: f32) -> Color {
+        let bg_color = Self::background();
+
+        let (r1, g1, b1) = match color {
+            Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
+            _ => return color, // Cannot fade non-RGB colors easily
+        };
+        let (r2, g2, b2) = match bg_color {
+            Color::Rgb(r, g, b) => (r as f32, g as f32, b as f32),
+            _ => return color,
+        };
+
+        let progress = fade_progress.max(0.0).min(1.0);
+
+        let r = (r1 * progress + r2 * (1.0 - progress)) as u8;
+        let g = (g1 * progress + g2 * (1.0 - progress)) as u8;
+        let b = (b1 * progress + b2 * (1.0 - progress)) as u8;
+
+        Color::Rgb(r, g, b)
+    }
+
     // ============================================================================
     // Block Styling (Claude-like appearance)
     // ============================================================================
@@ -155,29 +158,47 @@ impl Theme {
     }
 
     /// Create a styled block with title (Claude Code style)
-    pub fn block<'a>(title: impl Into<ratatui::text::Line<'a>>) -> Block<'a> {
+    pub fn block<'a>(title: impl Into<ratatui::text::Line<'a>>, fade_progress: Option<f32>) -> Block<'a> {
+        let border_color = if let Some(progress) = fade_progress {
+            Self::apply_fade_to_color(Self::primary(), progress)
+        } else {
+            Self::primary()
+        };
+
         Block::default()
             .title(title)
             .borders(Borders::ALL)
             .border_type(Self::border_type())
-            .border_style(ratatui::style::Style::default().fg(Self::primary()))
+            .border_style(ratatui::style::Style::default().fg(border_color))
     }
 
     /// Create a styled block without title
-    pub fn block_plain<'a>() -> Block<'a> {
+    pub fn block_plain<'a>(fade_progress: Option<f32>) -> Block<'a> {
+        let border_color = if let Some(progress) = fade_progress {
+            Self::apply_fade_to_color(Self::text_muted(), progress)
+        } else {
+            Self::text_muted()
+        };
+
         Block::default()
             .borders(Borders::ALL)
             .border_type(Self::border_type())
-            .border_style(ratatui::style::Style::default().fg(Self::text_muted()))
+            .border_style(ratatui::style::Style::default().fg(border_color))
     }
 
     /// Create a focused/active block (brighter border)
-    pub fn block_focused<'a>(title: impl Into<ratatui::text::Line<'a>>) -> Block<'a> {
+    pub fn block_focused<'a>(title: impl Into<ratatui::text::Line<'a>>, fade_progress: Option<f32>) -> Block<'a> {
+        let border_color = if let Some(progress) = fade_progress {
+            Self::apply_fade_to_color(Self::accent(), progress)
+        } else {
+            Self::accent()
+        };
+
         Block::default()
             .title(title)
             .borders(Borders::ALL)
             .border_type(Self::border_type())
-            .border_style(ratatui::style::Style::default().fg(Self::accent()))
+            .border_style(ratatui::style::Style::default().fg(border_color))
     }
 }
 
@@ -253,7 +274,7 @@ impl Icons {
 
     pub fn running() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "●"
+            "\u{f04b}" // fa-play
         } else {
             "[*]"
         }
@@ -261,7 +282,7 @@ impl Icons {
 
     pub fn stopped() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "○"
+            "\u{f04d}" // fa-stop
         } else {
             "[ ]"
         }
@@ -273,7 +294,7 @@ impl Icons {
 
     pub fn git() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "⎇"  // Unicode: git branch symbol
+            "\u{e702}" // devicons-git
         } else {
             "[git]"
         }
@@ -281,7 +302,7 @@ impl Icons {
 
     pub fn database() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "⚑"  // Unicode: database/flag symbol
+            "\u{f1c0}" // fa-database
         } else {
             "[db]"
         }
@@ -289,7 +310,7 @@ impl Icons {
 
     pub fn test() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "✓"  // Unicode: test/check symbol
+            "\u{f0ae}" // fa-list-ol
         } else {
             "[test]"
         }
@@ -297,7 +318,7 @@ impl Icons {
 
     pub fn query() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "↯"  // Unicode: query/lightning symbol
+            "\u{f002}" // fa-search
         } else {
             "[sql]"
         }
@@ -305,7 +326,7 @@ impl Icons {
 
     pub fn exception() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "⚠"  // Unicode: warning triangle (same as warning())
+            "⚠" // ⚠ (Keep existing)
         } else {
             "[err]"
         }
@@ -313,7 +334,7 @@ impl Icons {
 
     pub fn logs() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "◉"  // Unicode: log/document symbol
+            "\u{f0f6}" // fa-file-text-o
         } else {
             "[log]"
         }
@@ -325,7 +346,7 @@ impl Icons {
 
     pub fn quit() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "◼"  // Unicode: quit/stop symbol
+            "\u{f011}" // fa-power-off
         } else {
             "[q]"
         }
@@ -333,7 +354,7 @@ impl Icons {
 
     pub fn search() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "⌕"  // Unicode: search/magnifying glass
+            "\u{f002}" // fa-search
         } else {
             "[/]"
         }
@@ -341,7 +362,7 @@ impl Icons {
 
     pub fn scroll() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "↕"  // Unicode: already good!
+            "↕" // ↕ (Keep existing)
         } else {
             "[^v]"
         }
@@ -349,7 +370,7 @@ impl Icons {
 
     pub fn clear() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "⌫"  // Unicode: clear/delete symbol
+            "\u{f1f8}" // fa-trash
         } else {
             "[c]"
         }
@@ -357,7 +378,7 @@ impl Icons {
 
     pub fn toggle() -> &'static str {
         if super::icon_manager::IconManager::using_nerd_fonts() {
-            "⇄"  // Unicode: toggle/switch symbol
+            "⇄" // ⇄ (Keep existing)
         } else {
             "[t]"
         }

@@ -1,15 +1,27 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     widgets::{Cell, Row, Table},
     Frame,
 };
 
 use crate::test::TestTracker;
 use crate::ui::theme::Theme;
+use crate::ui::widgets::Spinner;
 
-pub fn render(f: &mut Frame, area: Rect, test_tracker: &TestTracker) {
+pub fn render(f: &mut Frame, area: Rect, test_tracker: &TestTracker, spinner_frame: usize, fade_progress: Option<f32>) {
     let stats = test_tracker.get_stats();
+
+    if stats.total_runs == 0 {
+        let loading_spinner = Spinner::new("Waiting for test results...", spinner_frame)
+            .style(Style::default().fg(Theme::apply_fade_to_color(Theme::text_muted(), fade_progress.unwrap_or(1.0))));
+
+        let block = Theme::block("Test Results", fade_progress);
+        f.render_widget(loading_spinner, block.inner(area));
+        f.render_widget(block, area);
+        return;
+    }
+
     let mut rows = vec![
         Row::new(vec![
             Cell::from("Total runs"),
@@ -24,9 +36,9 @@ pub fn render(f: &mut Frame, area: Rect, test_tracker: &TestTracker) {
             Cell::from(stats.total_failed.to_string()),
         ])
         .style(if stats.total_failed > 0 {
-            Style::default().fg(Color::Red)
+            Style::default().fg(Theme::danger())
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(Theme::success())
         }),
         Row::new(vec![
             Cell::from("Average duration"),
@@ -48,7 +60,7 @@ pub fn render(f: &mut Frame, area: Rect, test_tracker: &TestTracker) {
                     Cell::from("⚡ Debugger"),
                     Cell::from(debugger_text),
                 ])
-                .style(Style::default().fg(Color::Yellow))
+                .style(Style::default().fg(Theme::warning()))
             );
         }
     }
@@ -60,7 +72,7 @@ pub fn render(f: &mut Frame, area: Rect, test_tracker: &TestTracker) {
             ratatui::layout::Constraint::Percentage(50),
         ],
     )
-    .block(Theme::block("Test Results"));
+    .block(Theme::block("Test Results", fade_progress));
 
     f.render_widget(table, area);
 }

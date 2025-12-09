@@ -1,6 +1,38 @@
 /// Formatting utilities for consistent display of numbers, durations, and text
 use std::time::Duration;
 
+/// Format elapsed time in human-readable relative format
+///
+/// # Examples
+/// ```rust
+/// use caboose::ui::formatting::format_relative_time;
+/// use std::time::Duration;
+///
+/// assert_eq!(format_relative_time(Duration::from_secs(30)), "<1 min");
+/// assert_eq!(format_relative_time(Duration::from_secs(90)), "1 min ago");
+/// assert_eq!(format_relative_time(Duration::from_secs(150)), "2 mins ago");
+/// assert_eq!(format_relative_time(Duration::from_secs(3700)), "1 hr ago");
+/// ```
+pub fn format_relative_time(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+
+    if seconds < 60 {
+        "<1 min".to_string()
+    } else if seconds < 120 {
+        "1 min ago".to_string()
+    } else if seconds < 3600 {
+        format!("{} mins ago", seconds / 60)
+    } else if seconds < 7200 {
+        "1 hr ago".to_string()
+    } else if seconds < 86400 {
+        format!("{} hrs ago", seconds / 3600)
+    } else if seconds < 172800 {
+        "1 day ago".to_string()
+    } else {
+        format!("{} days ago", seconds / 86400)
+    }
+}
+
 /// Format numbers with thousands separators
 ///
 /// # Examples

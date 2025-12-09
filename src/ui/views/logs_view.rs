@@ -2,14 +2,15 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{List, ListItem, Paragraph},
     Frame,
 };
 
 use crate::process::{LogLine, ProcessInfo, ProcessStatus};
 use crate::ui::components::ScrollIndicator;
-use crate::ui::formatting::{format_duration, format_number};
+use crate::ui::formatting::format_duration;
 use crate::ui::theme::{Icons, Theme};
+use crate::ui::widgets::Spinner;
 
 /// Render the logs view
 pub fn render(
@@ -22,10 +23,12 @@ pub fn render(
     log_scroll: usize,
     auto_scroll: bool,
     filter_process: &Option<String>,
+    spinner_frame: usize,
+    fade_progress: Option<f32>,
 ) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints([Constraint::Length(30), Constraint::Min(0)]) // Fixed width for processes
         .split(area);
 
     render_processes(f, chunks[0], processes);
@@ -37,6 +40,8 @@ pub fn render(
         auto_scroll,
         search_query,
         filter_process,
+        spinner_frame,
+        fade_progress,
     );
 }
 
@@ -45,9 +50,9 @@ fn render_processes(f: &mut Frame, area: ratatui::layout::Rect, processes: &[Pro
         .iter()
         .map(|p| {
             let (status_icon, status_color) = match p.status {
-                ProcessStatus::Running => (Icons::running(), Theme::SUCCESS),
-                ProcessStatus::Stopped => (Icons::stopped(), Theme::TEXT_MUTED),
-                ProcessStatus::Crashed => (Icons::error(), Theme::DANGER),
+                ProcessStatus::Running => (Icons::running(), Theme::success()),
+                ProcessStatus::Stopped => (Icons::stopped(), Theme::text_muted()),
+                ProcessStatus::Crashed => (Icons::error(), Theme::danger()),
             };
 
             let uptime = p.start_time.map_or("--".to_string(), |start| {
@@ -69,18 +74,18 @@ fn render_processes(f: &mut Frame, area: ratatui::layout::Rect, processes: &[Pro
                 Span::styled(
                     format!("{:14}", p.name),
                     Style::default()
-                        .fg(Theme::PRIMARY)
+                        .fg(Theme::primary())
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{:9}", status_text),
                     Style::default().fg(status_color),
                 ),
-                Span::styled("  ", Style::default().fg(Theme::TEXT_SECONDARY)),
+                Span::styled("  ", Style::default().fg(Theme::text_secondary())),
                 Span::raw(" "),
                 Span::styled(
                     format!("{:>10}", uptime),
-                    Style::default().fg(Theme::WARNING),
+                    Style::default().fg(Theme::warning()),
                 ),
             ]);
 
@@ -89,13 +94,8 @@ fn render_processes(f: &mut Frame, area: ratatui::layout::Rect, processes: &[Pro
         .collect();
 
     let processes_widget = List::new(process_items).block(
-        Block::default()
-            .title(Span::styled(
-                "  Processes  ",
-                Style::default().fg(Theme::TEXT_PRIMARY),
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Theme::TEXT_MUTED)),
+        Theme::block("  Processes  ", None) // No fade on process list for now
+            .border_style(Style::default().fg(Theme::text_muted())),
     );
 
     f.render_widget(processes_widget, area);
@@ -109,7 +109,23 @@ fn render_logs(
     auto_scroll: bool,
     search_query: &str,
     filter_process: &Option<String>,
+    spinner_frame: usize,
+    fade_progress: Option<f32>,
 ) {
+    // If there are no logs at all, show a loading spinner
+    if logs.is_empty() {
+        let loading_spinner = Spinner::new("Waiting for logs...", spinner_frame)
+            .style(Style::default().fg(Theme::apply_fade_to_color(Theme::text_muted(), fade_progress.unwrap_or(1.0))));
+        
+        let block = Theme::block("Logs", fade_progress)
+            .border_style(Style::default().fg(Theme::apply_fade_to_color(Theme::text_muted(), fade_progress.unwrap_or(1.0))));
+
+        f.render_widget(loading_spinner, block.inner(area));
+        f.render_widget(block, area);
+        return;
+    }
+
+
     // Filter logs
     let mut filtered: Vec<&LogLine> = if let Some(filter) = filter_process {
         logs.iter()
@@ -138,16 +154,32 @@ fn render_logs(
         .skip(start_idx)
         .take(visible_height.max(1))
         .map(|log| {
-            let content_style = if log.content.contains("SELECT")
+            // Check for Rails-specific errors first for prominent highlighting
+            let is_rails_error = log.content.to_lowercase().contains("pending migration")
+                || (log.content.to_lowercase().contains("database")
+                    && log.content.to_lowercase().contains("does not exist"))
+                || log.content.to_lowercase().contains("could not connect to server")
+                || log.content.to_lowercase().contains("address already in use")
+                || (log.content.to_lowercase().contains("port")
+                    && log.content.to_lowercase().contains("already in use"))
+                || log.content.to_lowercase().contains("could not find gem")
+                || log.content.to_lowercase().contains("secret_key_base");
+
+            let content_style = if is_rails_error {
+                // Bright red + bold for critical Rails errors
+                Style::default()
+                    .fg(Theme::danger())
+                    .add_modifier(Modifier::BOLD)
+            } else if log.content.contains("SELECT")
                 || log.content.contains("INSERT")
                 || log.content.contains("UPDATE")
                 || log.content.contains("DELETE")
             {
-                Style::default().fg(Theme::INFO)
+                Style::default().fg(Theme::info())
             } else if log.content.contains("ERROR") || log.content.contains("Exception") {
-                Style::default().fg(Theme::DANGER)
+                Style::default().fg(Theme::danger())
             } else if log.content.contains("Completed") {
-                Style::default().fg(Theme::SUCCESS)
+                Style::default().fg(Theme::success())
             } else {
                 Style::default()
             };
@@ -162,39 +194,23 @@ fn render_logs(
         })
         .collect();
 
-    let scroll_indicator = ScrollIndicator::new(start_idx, total_logs, visible_height);
+    let _scroll_indicator = ScrollIndicator::new(start_idx, total_logs, visible_height);
 
     let log_title = if let Some(filter) = filter_process {
-        format!(
-            "  Logs  {} {} / {}{}",
-            filter,
-            format_number(start_idx + 1),
-            format_number(total_logs),
-            scroll_indicator
-        )
+        format!(" Logs (Filtered by {})", filter)
     } else if !search_query.is_empty() {
-        format!(
-            "  Logs  {} {} / {}{}",
-            search_query,
-            format_number(start_idx + 1),
-            format_number(total_logs),
-            scroll_indicator
-        )
+        format!(" Logs (Search: {})", search_query)
     } else {
-        format!(
-            "  Logs  {} / {}{}",
-            format_number(start_idx + 1),
-            format_number(total_logs.max(1)),
-            scroll_indicator
-        )
+        " Logs ".to_string()
     };
 
     let logs_widget = Paragraph::new(log_lines).block(
-        Block::default()
-            .title(Span::styled(log_title, Style::default().fg(Theme::TEXT_PRIMARY)))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Theme::TEXT_MUTED)),
+        Theme::block(log_title, fade_progress)
+            .border_style(Style::default().fg(Theme::apply_fade_to_color(Theme::text_muted(), fade_progress.unwrap_or(1.0)))),
     );
+
+    // Render the scroll indicator separately as a title or suffix if needed
+    // For now, it's removed from the main title to reduce density.
 
     f.render_widget(logs_widget, area);
 }

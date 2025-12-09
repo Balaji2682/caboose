@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct RailsApp {
@@ -7,6 +8,14 @@ pub struct RailsApp {
     pub database: Option<String>,
     pub background_job: Option<String>,
     pub asset_pipeline: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RailsHealthIssue {
+    PendingMigrations(Vec<String>),
+    DatabaseNotCreated,
+    DatabaseConnectionError(String),
+    BundleOutdated(String),
 }
 
 impl RailsApp {
@@ -92,5 +101,66 @@ impl RailsApp {
         }
 
         procfile
+    }
+
+    /// Check for Rails health issues (pending migrations, database connectivity)
+    pub fn check_health(&self) -> Vec<RailsHealthIssue> {
+        if !self.detected {
+            return vec![];
+        }
+
+        let mut issues = vec![];
+
+        // Check if bundle install is needed
+        if let Ok(output) = Command::new("bundle")
+            .args(["check"])
+            .output()
+        {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let message = if !stderr.is_empty() {
+                    stderr.to_string()
+                } else if !stdout.is_empty() {
+                    stdout.to_string()
+                } else {
+                    "Gemfile dependencies are not satisfied".to_string()
+                };
+                issues.push(RailsHealthIssue::BundleOutdated(message));
+                // If bundle check fails, skip other checks as they'll likely fail too
+                return issues;
+            }
+        }
+
+        // Check for pending migrations
+        if let Ok(output) = Command::new("bundle")
+            .args(["exec", "rails", "db:migrate:status"])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let pending: Vec<String> = stdout
+                    .lines()
+                    .filter(|line| line.contains("down"))
+                    .map(|line| line.trim().to_string())
+                    .collect();
+
+                if !pending.is_empty() {
+                    issues.push(RailsHealthIssue::PendingMigrations(pending));
+                }
+            } else {
+                // Check if database doesn't exist
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("database") && stderr.contains("does not exist") {
+                    issues.push(RailsHealthIssue::DatabaseNotCreated);
+                } else if stderr.contains("could not connect") || stderr.contains("connection") {
+                    issues.push(RailsHealthIssue::DatabaseConnectionError(
+                        stderr.lines().next().unwrap_or("Unknown error").to_string()
+                    ));
+                }
+            }
+        }
+
+        issues
     }
 }

@@ -4,7 +4,7 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::ui::theme::Theme;
+use crate::ui::theme::{Theme, Icons};
 
 /// Represents a keyboard shortcut
 pub struct KeyBinding {
@@ -77,13 +77,13 @@ impl FooterBuilder {
             spans.push(Span::styled(
                 binding.key.clone(),
                 Style::default()
-                    .fg(Theme::TEXT_PRIMARY)
+                    .fg(Theme::text_primary())
                     .add_modifier(Modifier::BOLD),
             ));
 
             spans.push(Span::styled(
-                format!(" {}", binding.description),
-                Style::default().fg(Theme::TEXT_SECONDARY),
+                format!(" {} {}", Icons::SEPARATOR, binding.description),
+                Style::default().fg(Theme::text_secondary()),
             ));
         }
 

@@ -1,90 +1,109 @@
-/// Progress gauge widget for displaying percentages visually
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Style},
+    symbols,
+    text::Span,
+    widgets::{Block, Widget},
+};
 
-/// Gauge widget - displays a visual progress bar
-pub struct Gauge {
-    percentage: f64,
-    width: usize,
-    filled_char: char,
-    empty_char: char,
+/// A widget to display a progress gauge.
+///
+/// This gauge is highly customizable and supports gradients.
+#[derive(Debug, Clone)]
+pub struct Gauge<'a> {
+    block: Option<Block<'a>>,
+    percent: u16,
+    label: Option<Span<'a>>,
+    gradient: Vec<Color>,
+    gauge_style: Style,
 }
 
-impl Gauge {
-    /// Create a new gauge with default characters (█ and ░)
-    pub fn new(percentage: f64, width: usize) -> Self {
+impl<'a> Default for Gauge<'a> {
+    fn default() -> Self {
         Self {
-            percentage: percentage.max(0.0).min(100.0),
-            width,
-            filled_char: '█',
-            empty_char: '░',
+            block: None,
+            percent: 0,
+            label: None,
+            gradient: vec![Color::Green, Color::Yellow, Color::Red],
+            gauge_style: Style::default(),
         }
     }
+}
 
-    /// Set custom filled character
-    pub fn filled_char(mut self, ch: char) -> Self {
-        self.filled_char = ch;
+impl<'a> Gauge<'a> {
+    pub fn block(mut self, block: Block<'a>) -> Self {
+        self.block = Some(block);
         self
     }
 
-    /// Set custom empty character
-    pub fn empty_char(mut self, ch: char) -> Self {
-        self.empty_char = ch;
+    pub fn percent(mut self, percent: u16) -> Self {
+        self.percent = percent.min(100);
         self
     }
 
-    /// Render the gauge as a string
-    pub fn render(&self) -> String {
-        let filled = ((self.percentage / 100.0) * self.width as f64) as usize;
-        let empty = self.width.saturating_sub(filled);
-
-        format!(
-            "{}{}",
-            self.filled_char.to_string().repeat(filled),
-            self.empty_char.to_string().repeat(empty)
-        )
+    pub fn label(mut self, label: impl Into<Span<'a>>) -> Self {
+        self.label = Some(label.into());
+        self
     }
 
-    /// Get the percentage value
-    pub fn percentage(&self) -> f64 {
-        self.percentage
+    pub fn gradient(mut self, gradient: Vec<Color>) -> Self {
+        self.gradient = gradient;
+        self
+    }
+
+    pub fn gauge_style(mut self, style: Style) -> Self {
+        self.gauge_style = style;
+        self
+    }
+
+    fn get_gradient_color(&self, percent: u16) -> Color {
+        if self.gradient.is_empty() {
+            return self.gauge_style.fg.unwrap_or(Color::Reset);
+        }
+        let index = (percent as usize * (self.gradient.len() - 1)) / 100;
+        self.gradient[index]
     }
 }
 
-impl std::fmt::Display for Gauge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.render())
-    }
-}
+impl<'a> Widget for Gauge<'a> {
+    fn render(mut self, area: Rect, buf: &mut Buffer) {
+        let gauge_area = match self.block.take() {
+            Some(b) => {
+                let inner_area = b.inner(area);
+                b.render(area, buf);
+                inner_area
+            }
+            None => area,
+        };
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+        if gauge_area.height < 1 {
+            return;
+        }
 
-    #[test]
-    fn test_gauge_rendering() {
-        let gauge = Gauge::new(50.0, 10);
-        assert_eq!(gauge.render(), "█████░░░░░");
+        let filled_width = (gauge_area.width as u16 * self.percent) / 100;
+        
+        // Render filled portion with gradient
+        for i in 0..filled_width {
+            let p = (i * 100) / gauge_area.width;
+            let color = self.get_gradient_color(p);
+            buf.get_mut(gauge_area.x + i, gauge_area.y)
+                .set_symbol(symbols::block::FULL)
+                .set_fg(color);
+        }
 
-        let gauge = Gauge::new(100.0, 10);
-        assert_eq!(gauge.render(), "██████████");
+        // Render empty portion
+        for i in filled_width..gauge_area.width {
+            buf.get_mut(gauge_area.x + i, gauge_area.y)
+                .set_symbol(" ")
+                .set_style(self.gauge_style);
+        }
 
-        let gauge = Gauge::new(0.0, 10);
-        assert_eq!(gauge.render(), "░░░░░░░░░░");
-    }
-
-    #[test]
-    fn test_gauge_custom_chars() {
-        let gauge = Gauge::new(50.0, 10)
-            .filled_char('▓')
-            .empty_char('░');
-        assert_eq!(gauge.render(), "▓▓▓▓▓░░░░░");
-    }
-
-    #[test]
-    fn test_gauge_bounds() {
-        let gauge = Gauge::new(150.0, 10); // Over 100%
-        assert_eq!(gauge.percentage(), 100.0);
-
-        let gauge = Gauge::new(-10.0, 10); // Under 0%
-        assert_eq!(gauge.percentage(), 0.0);
+        // Render label
+        if let Some(label) = self.label {
+            let label_width = label.width() as u16;
+            let label_col = gauge_area.x + (gauge_area.width - label_width) / 2;
+            buf.set_span(label_col, gauge_area.y, &label, label_width);
+        }
     }
 }

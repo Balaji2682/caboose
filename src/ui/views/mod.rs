@@ -5,6 +5,7 @@ pub mod request_detail_view;
 pub mod database_health_view;
 pub mod test_results_view;
 pub mod exceptions_view;
+pub mod exception_detail_view;
 
 use ratatui::Frame;
 

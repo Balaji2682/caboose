@@ -44,7 +44,7 @@ impl<'a> HeaderBuilder<'a> {
     ) -> Self {
         let line = Line::from(vec![
             Span::raw("   "),
-            Span::styled(label, Style::default().fg(Theme::TEXT_SECONDARY)),
+            Span::styled(label, Style::default().fg(Theme::text_secondary())),
             Span::styled(
                 value,
                 Style::default()
@@ -66,7 +66,7 @@ impl<'a> HeaderBuilder<'a> {
             title_spans.push(Span::styled(
                 format!("   {} ", icon),
                 Style::default()
-                    .fg(Theme::PRIMARY)
+                    .fg(Theme::primary())
                     .add_modifier(Modifier::BOLD),
             ));
         } else {
@@ -76,7 +76,7 @@ impl<'a> HeaderBuilder<'a> {
         title_spans.push(Span::styled(
             self.title,
             Style::default()
-                .fg(Theme::PRIMARY)
+                .fg(Theme::primary())
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -110,12 +110,12 @@ pub fn metric_line<'a>(
         Span::styled(
             value,
             Style::default()
-                .fg(Theme::TEXT_PRIMARY)
+                .fg(Theme::text_primary())
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(" {}", label),
-            Style::default().fg(Theme::TEXT_SECONDARY),
+            Style::default().fg(Theme::text_secondary()),
         ),
     ])
 }
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn test_header_with_stats() {
         let header = HeaderBuilder::new("Test")
-            .add_stat("Count: ", "100".to_string(), Theme::SUCCESS)
+            .add_stat("Count: ", "100".to_string(), Theme::success())
             .build();
 
         assert!(header.len() >= 2); // Title + empty line + stat

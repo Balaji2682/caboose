@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{List, ListItem, Paragraph},
     Frame,
 };
 
@@ -30,6 +30,7 @@ pub fn render_command_palette(
     suggestions: &[Suggestion],
     selected_suggestion: usize,
     error: Option<&str>,
+    fade_progress: Option<f32>,
 ) {
     // Split area into input + suggestions
     let chunks = Layout::default()
@@ -41,56 +42,48 @@ pub fn render_command_palette(
         .split(area);
 
     // Render input field
-    render_input(f, chunks[0], input, error);
+    render_input(f, chunks[0], input, error, fade_progress);
 
     // Render suggestions if available
     if !suggestions.is_empty() {
-        render_suggestions(f, chunks[1], suggestions, selected_suggestion);
+        render_suggestions(f, chunks[1], suggestions, selected_suggestion, fade_progress);
     }
 }
 
 /// Render the command input field
-fn render_input(f: &mut Frame, area: Rect, input: &str, error: Option<&str>) {
+fn render_input(f: &mut Frame, area: Rect, input: &str, error: Option<&str>, fade_progress: Option<f32>) {
     let (style, border_color) = if error.is_some() {
         (
-            Style::default().fg(Theme::DANGER),
-            Theme::DANGER,
+            Style::default().fg(Theme::apply_fade_to_color(Theme::danger(), fade_progress.unwrap_or(1.0))),
+            Theme::apply_fade_to_color(Theme::danger(), fade_progress.unwrap_or(1.0)),
         )
     } else {
         (
-            Style::default().fg(Theme::TEXT_PRIMARY),
-            Theme::PRIMARY,
+            Style::default().fg(Theme::apply_fade_to_color(Theme::text_primary(), fade_progress.unwrap_or(1.0))),
+            Theme::apply_fade_to_color(Theme::primary(), fade_progress.unwrap_or(1.0)),
         )
     };
 
     let text = if let Some(err_msg) = error {
         Line::from(vec![
-            Span::styled(" > ", Style::default().fg(Theme::PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" > ", Style::default().fg(Theme::apply_fade_to_color(Theme::primary(), fade_progress.unwrap_or(1.0))).add_modifier(Modifier::BOLD)),
             Span::styled(input, style),
             Span::raw("  "),
             Span::styled(
                 format!(" {} {}", Icons::error(), err_msg),
-                Style::default().fg(Theme::DANGER),
+                Style::default().fg(Theme::apply_fade_to_color(Theme::danger(), fade_progress.unwrap_or(1.0))),
             ),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" > ", Style::default().fg(Theme::PRIMARY).add_modifier(Modifier::BOLD)),
+            Span::styled(" > ", Style::default().fg(Theme::apply_fade_to_color(Theme::primary(), fade_progress.unwrap_or(1.0))).add_modifier(Modifier::BOLD)),
             Span::styled(input, style),
-            Span::styled("█", Style::default().fg(Theme::PRIMARY)), // Cursor
+            Span::styled("█", Style::default().fg(Theme::apply_fade_to_color(Theme::primary(), fade_progress.unwrap_or(1.0)))), // Cursor
         ])
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(Theme::border_type())
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            " Command ",
-            Style::default()
-                .fg(Theme::PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        ));
+    let block = Theme::block(" Command ", fade_progress)
+        .border_style(Style::default().fg(border_color));
 
     let paragraph = Paragraph::new(text).block(block);
 
@@ -103,6 +96,7 @@ fn render_suggestions(
     area: Rect,
     suggestions: &[Suggestion],
     selected: usize,
+    fade_progress: Option<f32>,
 ) {
     let items: Vec<ListItem> = suggestions
         .iter()
@@ -115,17 +109,19 @@ fn render_suggestions(
                 Line::from(vec![
                     Span::styled(
                         format!(" {} ", Icons::right_triangle()),
-                        Style::default().fg(Theme::PRIMARY),
+                        Style::default().fg(Theme::apply_fade_to_color(Theme::primary(), fade_progress.unwrap_or(1.0))),
                     ),
                     Span::styled(
                         format!("{:<12}", suggestion.text),
                         Style::default()
-                            .fg(Theme::PRIMARY)
+                            .fg(Theme::apply_fade_to_color(Theme::text_primary(), fade_progress.unwrap_or(1.0)))
+                            .bg(Theme::apply_fade_to_color(Theme::surface(), fade_progress.unwrap_or(1.0))) // Subtle background for selected
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!(" - {}", suggestion.description),
-                        Style::default().fg(Theme::TEXT_SECONDARY),
+                        Style::default().fg(Theme::apply_fade_to_color(Theme::text_secondary(), fade_progress.unwrap_or(1.0)))
+                            .bg(Theme::apply_fade_to_color(Theme::surface(), fade_progress.unwrap_or(1.0))), // Also apply background to description
                     ),
                 ])
             } else {
@@ -133,11 +129,11 @@ fn render_suggestions(
                     Span::raw("   "),
                     Span::styled(
                         format!("{:<12}", suggestion.text),
-                        Style::default().fg(Theme::TEXT_PRIMARY),
+                        Style::default().fg(Theme::apply_fade_to_color(Theme::text_primary(), fade_progress.unwrap_or(1.0))),
                     ),
                     Span::styled(
                         format!(" - {}", suggestion.description),
-                        Style::default().fg(Theme::TEXT_MUTED),
+                        Style::default().fg(Theme::apply_fade_to_color(Theme::text_secondary(), fade_progress.unwrap_or(1.0))),
                     ),
                 ])
             };
@@ -147,13 +143,11 @@ fn render_suggestions(
         .collect();
 
     let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(Theme::border_type())
-            .border_style(Style::default().fg(Theme::TEXT_MUTED))
+        Theme::block_plain(fade_progress)
+            .border_style(Style::default().fg(Theme::apply_fade_to_color(Theme::text_muted(), fade_progress.unwrap_or(1.0))))
             .title(Span::styled(
                 format!(" Suggestions ({}) ", suggestions.len()),
-                Style::default().fg(Theme::TEXT_SECONDARY),
+                Style::default().fg(Theme::apply_fade_to_color(Theme::text_secondary(), fade_progress.unwrap_or(1.0))),
             )),
     );
 
@@ -161,30 +155,28 @@ fn render_suggestions(
 }
 
 /// Render command result message (success or error)
-pub fn render_command_result(f: &mut Frame, area: Rect, message: &str, is_error: bool) {
+pub fn render_command_result(f: &mut Frame, area: Rect, message: &str, is_error: bool, fade_progress: Option<f32>) {
     let (icon, color) = if is_error {
-        (Icons::error(), Theme::DANGER)
+        (Icons::error(), Theme::danger())
     } else {
-        (Icons::success(), Theme::SUCCESS)
+        (Icons::success(), Theme::success())
     };
 
     let text = Line::from(vec![
         Span::styled(
             format!(" {} ", icon),
-            Style::default().fg(color),
+            Style::default().fg(Theme::apply_fade_to_color(color, fade_progress.unwrap_or(1.0))),
         ),
         Span::styled(
             message,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            Style::default().fg(Theme::apply_fade_to_color(color, fade_progress.unwrap_or(1.0))).add_modifier(Modifier::BOLD),
         ),
     ]);
 
     let paragraph = Paragraph::new(text)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(Theme::border_type())
-                .border_style(Style::default().fg(color)),
+            Theme::block_plain(fade_progress)
+                .border_style(Style::default().fg(Theme::apply_fade_to_color(color, fade_progress.unwrap_or(1.0)))),
         )
         .alignment(Alignment::Left);
 
