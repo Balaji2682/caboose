@@ -1,0 +1,122 @@
+name: Release (macOS)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-macos:
+    name: Build and publish macOS binaries
+    runs-on: macos-latest
+
+    strategy:
+      matrix:
+        target:
+          - x86_64-apple-darwin  # Intel Macs
+          - aarch64-apple-darwin  # Apple Silicon (M1/M2/M3)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: macos-${{ matrix.target }}
+
+      - name: Run tests (native only)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Extract version and tag
+        id: metadata
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="caboose") | .version')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          ARCH=$(echo ${{ matrix.target }} | cut -d'-' -f1)
+          if [ "$ARCH" = "x86_64" ]; then
+            ARCH_NAME="intel"
+          else
+            ARCH_NAME="apple-silicon"
+          fi
+
+          echo "arch_name=$ARCH_NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}-macos-${ARCH_NAME}.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/caboose dist/
+          strip dist/caboose || true
+          cd dist
+          tar -czf caboose-macos-${{ steps.metadata.outputs.arch_name }}.tar.gz caboose
+          cd ..
+          shasum -a 256 dist/caboose-macos-${{ steps.metadata.outputs.arch_name }}.tar.gz > dist/caboose-macos-${{ steps.metadata.outputs.arch_name }}.tar.gz.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.metadata.outputs.tag }}
+          name: Caboose ${{ steps.metadata.outputs.version }} (macOS ${{ steps.metadata.outputs.arch_name }} build ${{ github.run_number }})
+          body: |
+            macOS binary for ${{ matrix.target == 'x86_64-apple-darwin' && 'Intel Macs' || 'Apple Silicon (M1/M2/M3)' }}.
+
+            **Architecture:** ${{ matrix.target }}
+
+            **Compatible with:**
+            ${{ matrix.target == 'x86_64-apple-darwin' && '- ✅ Intel Macs (all models)
+            - ✅ macOS 12 Monterey
+            - ✅ macOS 13 Ventura
+            - ✅ macOS 14 Sonoma
+            - ✅ macOS 15 Sequoia' || '- ✅ Apple Silicon Macs (M1, M1 Pro, M1 Max, M1 Ultra)
+            - ✅ Apple Silicon Macs (M2, M2 Pro, M2 Max, M2 Ultra)
+            - ✅ Apple Silicon Macs (M3, M3 Pro, M3 Max)
+            - ✅ macOS 12 Monterey
+            - ✅ macOS 13 Ventura
+            - ✅ macOS 14 Sonoma
+            - ✅ macOS 15 Sequoia' }}
+
+            **Installation:**
+            ```bash
+            # Download and extract
+            curl -LO https://github.com/Balaji2682/caboose/releases/download/${{ steps.metadata.outputs.tag }}/caboose-macos-${{ steps.metadata.outputs.arch_name }}.tar.gz
+            tar -xzf caboose-macos-${{ steps.metadata.outputs.arch_name }}.tar.gz
+
+            # Install to PATH
+            sudo install caboose /usr/local/bin/
+
+            # Or run directly
+            ./caboose
+            ```
+
+            **Note:** On first run, macOS may ask for permission. Go to System Settings > Security & Privacy to allow.
+
+            - Commit: ${{ github.sha }}
+            - Version: ${{ steps.metadata.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/caboose-macos-${{ steps.metadata.outputs.arch_name }}.tar.gz
+            dist/caboose-macos-${{ steps.metadata.outputs.arch_name }}.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
