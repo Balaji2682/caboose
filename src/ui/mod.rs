@@ -1082,11 +1082,10 @@ fn render_header(
     );
     f.render_widget(Paragraph::new(error_rate_span), stats_layout[3]);
 
-    // Render sql queries
+    // Render sql queries with emoji icon
     let sql_queries_span = Span::styled(
         format!(
-            " {} {} queries",
-            Icons::database(),
+            " 🗄️ {} queries",
             format_number(stats.sql_queries)
         ),
         Style::default().fg(Theme::apply_fade_to_color(

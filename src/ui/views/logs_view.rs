@@ -56,10 +56,19 @@ fn render_processes(f: &mut Frame, area: ratatui::layout::Rect, processes: &[Pro
     let process_items: Vec<ListItem> = processes
         .iter()
         .map(|p| {
+            // Get status icon
             let (status_icon, status_color) = match p.status {
                 ProcessStatus::Running => (Icons::running(), Theme::success()),
                 ProcessStatus::Stopped => (Icons::stopped(), Theme::text_muted()),
                 ProcessStatus::Crashed => (Icons::error(), Theme::danger()),
+            };
+
+            // Get process type icon based on name
+            let process_type_icon = match p.name.as_str() {
+                "web" | "rails" => "🌐",
+                "angular" | "frontend" | "ui" => "⚡",
+                "worker" | "sidekiq" => "⚙️",
+                _ => "▪",
             };
 
             let uptime = p.start_time.map_or("--".to_string(), |start| {
@@ -74,16 +83,17 @@ fn render_processes(f: &mut Frame, area: ratatui::layout::Rect, processes: &[Pro
                 p.name.clone()
             };
 
-            // Compact layout to fit 30-char panel width:
-            // Icon(1) + Space(1) + Name(10) + Space(1) + Uptime(7) = ~20 chars
+            // Compact layout with both status and process type icons
             let content = Line::from(vec![
-                Span::styled(" ", Style::default()),
+                Span::raw(" "),
                 Span::styled(
                     status_icon,
                     Style::default()
                         .fg(status_color)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Span::raw(" "),
+                Span::raw(process_type_icon),
                 Span::raw(" "),
                 Span::styled(
                     format!("{:<10}", display_name),
@@ -165,12 +175,17 @@ fn render_logs(
         .take(visible_height.max(1))
         .map(|log| {
             // Apply horizontal scrolling to the content
-            let scrolled_content = if h_scroll > 0 && log.content.len() > h_scroll {
-                &log.content[h_scroll..]
-            } else if h_scroll > 0 {
-                "" // Scrolled past the content
+            // IMPORTANT: Use char-based operations to avoid UTF-8 boundary panics
+            let char_count = log.content.chars().count();
+            let scrolled_content: String = if h_scroll > 0 && h_scroll < char_count {
+                // Skip h_scroll characters safely
+                log.content.chars().skip(h_scroll).collect()
+            } else if h_scroll >= char_count {
+                // Scrolled past the end
+                String::new()
             } else {
-                &log.content
+                // No scroll
+                log.content.clone()
             };
             // Check for Rails-specific errors first for prominent highlighting
             let is_rails_error = log.content.to_lowercase().contains("pending migration")
