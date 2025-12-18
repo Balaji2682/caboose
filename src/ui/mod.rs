@@ -272,6 +272,24 @@ impl App {
         self.active_tab_index = next_index;
     }
 
+    /// Toggle to previous view (backward cycling)
+    pub fn toggle_view_backward(&mut self) {
+        let variants = ViewMode::all_variants();
+        let current_index = self.active_tab_index;
+        let prev_index = if current_index == 0 {
+            variants.len() - 1
+        } else {
+            current_index - 1
+        };
+
+        // Record previous view and time for transition
+        self.previous_view_mode = Some(self.view_mode.clone());
+        self.last_view_change_time = Some(Instant::now());
+
+        self.view_mode = ViewMode::from_index(prev_index).unwrap_or(ViewMode::Logs);
+        self.active_tab_index = prev_index;
+    }
+
     // ========================================================================
     // SEARCH MODE
     // ========================================================================
@@ -1059,7 +1077,7 @@ fn render_footer(
         FooterBuilder::new()
             .add_binding("q", "Quit")
             .add_binding(":", "Command")
-            .add_binding("t", "Toggle")
+            .add_binding("t/T", "Tab ←→")
             .add_binding("/", "Search")
             .add_binding("↑↓", "Scroll")
             .add_binding("c", "Clear")
@@ -1161,6 +1179,7 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('t') => app.toggle_view(),
+        KeyCode::Char('T') => app.toggle_view_backward(), // Shift+T for backward cycling
         KeyCode::Char(':') => app.enter_command_mode(),
         KeyCode::Char('/') => {
             if matches!(app.view_mode, ViewMode::Logs) {

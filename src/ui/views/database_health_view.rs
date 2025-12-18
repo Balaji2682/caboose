@@ -31,7 +31,13 @@ pub fn render(
 
     let issues_text: Vec<String> = issues
         .iter()
-        .map(|issue| format!("- {}", issue.title))
+        .map(|issue| {
+            if issue.description.is_empty() {
+                format!("• {}", issue.title)
+            } else {
+                format!("• {}\n  Query: {}", issue.title, issue.description)
+            }
+        })
         .collect();
     let issues_list =
         Paragraph::new(issues_text.join("\n")).block(Theme::block("Issues", fade_progress));
