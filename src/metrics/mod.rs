@@ -3,6 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::System;
 
+// Memory management constants
+const MAX_ENDPOINTS: usize = 500;
+const ENDPOINTS_WARNING_THRESHOLD: usize = 450; // 90% of max
+
 /// Time-series data point
 #[derive(Debug, Clone)]
 pub struct DataPoint {
@@ -213,6 +217,33 @@ impl AdvancedMetrics {
         // Update per-endpoint stats
         {
             let mut stats = self.endpoint_stats.lock().unwrap();
+
+            // Check if we're at capacity before adding new endpoint
+            if stats.len() >= MAX_ENDPOINTS && !stats.contains_key(&path) {
+                // Log warning when at capacity
+                eprintln!(
+                    "[WARN] Endpoint stats at capacity ({}), evicting least accessed endpoint",
+                    MAX_ENDPOINTS
+                );
+
+                // Evict least accessed endpoint (lowest request count)
+                if let Some(least_accessed_path) = stats
+                    .iter()
+                    .min_by_key(|(_, endpoint_stat)| endpoint_stat.count)
+                    .map(|(p, _)| p.clone())
+                {
+                    stats.remove(&least_accessed_path);
+                }
+            } else if stats.len() >= ENDPOINTS_WARNING_THRESHOLD && !stats.contains_key(&path) {
+                // Log warning when approaching capacity
+                eprintln!(
+                    "[WARN] Endpoint stats approaching capacity: {}/{} ({}%)",
+                    stats.len(),
+                    MAX_ENDPOINTS,
+                    (stats.len() * 100) / MAX_ENDPOINTS
+                );
+            }
+
             stats.entry(path.clone())
                 .or_insert_with(|| EndpointStats::new(path))
                 .add_request(duration);

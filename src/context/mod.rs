@@ -2,13 +2,13 @@ use crate::parser::{HttpRequest, LogEvent, SqlQuery};
 use crate::query::{
     NPlusOneDetector, NPlusOneIssue, QueryFingerprint, QueryInfo, QueryType, RequestContext,
 };
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Tracks request contexts and groups queries by request
 pub struct RequestContextTracker {
-    current_requests: Arc<Mutex<HashMap<String, RequestContext>>>,
+    current_requests: Arc<Mutex<VecDeque<RequestContext>>>,
     completed_requests: Arc<Mutex<Vec<CompletedRequest>>>,
     max_completed: usize,
 }
@@ -25,7 +25,7 @@ pub struct CompletedRequest {
 impl RequestContextTracker {
     pub fn new() -> Self {
         Self {
-            current_requests: Arc::new(Mutex::new(HashMap::new())),
+            current_requests: Arc::new(Mutex::new(VecDeque::new())),
             completed_requests: Arc::new(Mutex::new(Vec::new())),
             max_completed: 100,
         }
@@ -57,15 +57,15 @@ impl RequestContextTracker {
 
         let context = RequestContext::new(Some(path.clone()));
         let mut requests = self.current_requests.lock().unwrap();
-        requests.insert(path, context);
+        requests.push_back(context);
     }
 
     fn add_query_to_current_request(&self, sql_query: &SqlQuery) {
         let mut requests = self.current_requests.lock().unwrap();
 
-        // If we have an active request, add the query to it
-        // Otherwise, add it to a default "background" context
-        if let Some((_path, context)) = requests.iter_mut().next() {
+        // Add query to the most recent (last) active request
+        // Queries typically belong to the most recently started request
+        if let Some(context) = requests.back_mut() {
             let query_info = QueryInfo {
                 raw_query: sql_query.query.clone(),
                 fingerprint: QueryFingerprint::new(&sql_query.query),
@@ -81,9 +81,9 @@ impl RequestContextTracker {
     fn complete_request(&self, req: &HttpRequest) {
         let mut requests = self.current_requests.lock().unwrap();
 
-        // Find the matching request context
-        // Since we don't have exact path matching, take the first one
-        if let Some((_path, context)) = requests.drain().next() {
+        // Use FIFO: pop the oldest request (first in, first out)
+        // Rails typically completes requests in the order they started
+        if let Some(context) = requests.pop_front() {
             // Detect N+1 issues
             let n_plus_one_issues = NPlusOneDetector::detect(&context);
 
@@ -112,7 +112,7 @@ impl RequestContextTracker {
 
     pub fn get_current_requests(&self) -> Vec<RequestContext> {
         let current = self.current_requests.lock().unwrap();
-        current.values().cloned().collect()
+        current.iter().cloned().collect()
     }
 
     pub fn get_all_n_plus_one_issues(&self) -> Vec<NPlusOneIssue> {

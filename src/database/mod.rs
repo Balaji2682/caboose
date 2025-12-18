@@ -2,6 +2,10 @@ use ratatui::style::{Color, Style};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+// Memory management constants
+const MAX_TABLES_TRACKED: usize = 100;
+const TABLES_WARNING_THRESHOLD: usize = 90; // 90% of max
+
 #[derive(Debug, Clone)]
 pub struct TableInfo {
     pub name: String,
@@ -136,6 +140,37 @@ impl DatabaseHealth {
 
             // Track table access
             if let Some(table_name) = table {
+                // Check if we're at capacity before adding new table
+                if stats.tables_accessed.len() >= MAX_TABLES_TRACKED
+                    && !stats.tables_accessed.contains_key(&table_name)
+                {
+                    // Log warning when at capacity
+                    eprintln!(
+                        "[WARN] Tables tracking at capacity ({}), evicting least accessed table",
+                        MAX_TABLES_TRACKED
+                    );
+
+                    // Evict least accessed table
+                    if let Some(least_accessed_table) = stats
+                        .tables_accessed
+                        .iter()
+                        .min_by_key(|(_, count)| *count)
+                        .map(|(table, _)| table.clone())
+                    {
+                        stats.tables_accessed.remove(&least_accessed_table);
+                    }
+                } else if stats.tables_accessed.len() >= TABLES_WARNING_THRESHOLD
+                    && !stats.tables_accessed.contains_key(&table_name)
+                {
+                    // Log warning when approaching capacity
+                    eprintln!(
+                        "[WARN] Tables tracking approaching capacity: {}/{} ({}%)",
+                        stats.tables_accessed.len(),
+                        MAX_TABLES_TRACKED,
+                        (stats.tables_accessed.len() * 100) / MAX_TABLES_TRACKED
+                    );
+                }
+
                 *stats.tables_accessed.entry(table_name).or_insert(0) += 1;
             }
         }

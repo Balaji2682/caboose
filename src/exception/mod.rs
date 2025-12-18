@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+// Memory management constants
+const MAX_EXCEPTION_GROUPS: usize = 200;
+const EXCEPTION_GROUPS_WARNING_THRESHOLD: usize = 180; // 90% of max
+
 #[derive(Debug, Clone)]
 pub struct Exception {
     pub exception_type: String,
@@ -243,6 +247,29 @@ impl ExceptionTracker {
                     group.occurrences.remove(0);
                 }
             } else {
+                // Check if we're at capacity before adding new group
+                if grouped.len() >= MAX_EXCEPTION_GROUPS {
+                    // Log warning when at capacity
+                    eprintln!("[WARN] Exception groups at capacity ({}), evicting oldest group", MAX_EXCEPTION_GROUPS);
+
+                    // Evict oldest group by first_seen timestamp
+                    if let Some(oldest_key) = grouped
+                        .iter()
+                        .min_by_key(|(_, g)| g.first_seen)
+                        .map(|(k, _)| k.clone())
+                    {
+                        grouped.remove(&oldest_key);
+                    }
+                } else if grouped.len() >= EXCEPTION_GROUPS_WARNING_THRESHOLD {
+                    // Log warning when approaching capacity
+                    eprintln!(
+                        "[WARN] Exception groups approaching capacity: {}/{} ({}%)",
+                        grouped.len(),
+                        MAX_EXCEPTION_GROUPS,
+                        (grouped.len() * 100) / MAX_EXCEPTION_GROUPS
+                    );
+                }
+
                 stats.unique_exceptions += 1;
                 grouped.insert(
                     fingerprint.clone(),
