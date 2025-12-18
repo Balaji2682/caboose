@@ -251,6 +251,10 @@ impl App {
         self.logs.push(log);
         if self.logs.len() > self.max_logs {
             self.logs.remove(0);
+            // If we removed a log and scroll is out of bounds, adjust it
+            if !self.auto_scroll && self.log_scroll > 0 {
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+            }
         }
     }
 
@@ -447,6 +451,13 @@ impl App {
     pub fn scroll_down(&mut self) {
         self.log_scroll += 1;
         self.auto_scroll = false;
+
+        // Re-enable auto-scroll if we scroll to near the bottom
+        let total_logs = self.filtered_logs().len();
+        if total_logs > 0 && self.log_scroll + 10 >= total_logs {
+            self.auto_scroll = true;
+            self.log_scroll = 0;
+        }
     }
 
     pub fn scroll_page_up(&mut self, page_size: usize) {
@@ -457,6 +468,13 @@ impl App {
     pub fn scroll_page_down(&mut self, page_size: usize) {
         self.log_scroll += page_size;
         self.auto_scroll = false;
+
+        // Re-enable auto-scroll if we scroll to near the bottom
+        let total_logs = self.filtered_logs().len();
+        if total_logs > 0 && self.log_scroll + 10 >= total_logs {
+            self.auto_scroll = true;
+            self.log_scroll = 0;
+        }
     }
 
     pub fn select_next_request(&mut self) {
@@ -769,7 +787,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
         }
     }
 
-    render_footer(f, chunks[3], app.search_mode, Some(fade_progress));
+    render_footer(f, chunks[3], app, Some(fade_progress));
 
     // Render command palette overlay if in command mode
     if app.command_mode {
@@ -1064,24 +1082,31 @@ fn render_header(
 fn render_footer(
     f: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
-    search_mode: bool,
+    app: &App,
     fade_progress: Option<f32>,
 ) {
-    let footer = if search_mode {
+    let footer = if app.search_mode {
         FooterBuilder::new()
             .add_binding("Type to search", "")
             .add_binding("Esc", "Cancel")
             .add_binding("Enter", "Apply")
             .build()
     } else {
-        FooterBuilder::new()
+        let mut footer = FooterBuilder::new()
             .add_binding("q", "Quit")
             .add_binding(":", "Command")
             .add_binding("t/T", "Tab ←→")
             .add_binding("/", "Search")
-            .add_binding("↑↓", "Scroll")
-            .add_binding("c", "Clear")
-            .build()
+            .add_binding("↑↓", "Scroll");
+
+        // Show auto-scroll status if disabled
+        if !app.auto_scroll && matches!(app.view_mode, ViewMode::Logs) {
+            footer = footer.add_binding("End", "⚠️ Auto-scroll OFF");
+        } else {
+            footer = footer.add_binding("c", "Clear");
+        }
+
+        footer.build()
     };
 
     let footer_widget = Paragraph::new(footer).style(

@@ -57,7 +57,7 @@ impl RailsLogParser {
             // 1. Rails tagged: D, [2024-01-15T10:30:45.043111 #6322] DEBUG -- :
             // 2. Bracketed: [INFO 2018-07-01 11:55:04 65048] :
             // 3. Plain timestamp: 2024-01-15 10:30:45
-            Regex::new(r"^(?:[DIWEF],\s*\[[^\]]+\]\s+(?:DEBUG|INFO|WARN|ERROR|FATAL)\s+--\s*:\s*|\[[^\]]+\]\s*:\s*|\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^\s]*\s+)").unwrap()
+            Regex::new(r"^(?:[DIWEF],\s*[^\]]+]\s+(?:DEBUG|INFO|WARN|ERROR|FATAL)\s+--\s*:\s*|[^\]]+]\s*:\s*|\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}[^\s]*\s+)").unwrap()
         });
 
         if let Some(m) = re.find(line) {
@@ -81,7 +81,17 @@ impl RailsLogParser {
         PATTERN.get_or_init(|| {
             // Match key-value format: method=POST path=/users format=html
             // Captures method and path from anywhere in the line
-            Regex::new(r"method=([A-Z]+)(?:.*?)path=([^\s]+)").unwrap()
+            Regex::new(r"method=([A-Z]+).*?path=([^\s]+)").unwrap()
+        })
+    }
+
+    fn lograge_pattern() -> &'static Regex {
+        static PATTERN: OnceLock<Regex> = OnceLock::new();
+        PATTERN.get_or_init(|| {
+            // Match Lograge single-line format:
+            // method=GET path=/users ... status=200 duration=123.45
+            // Must have method, path, status, and duration to be a complete request
+            Regex::new(r"method=([A-Z]+).*?path=([^\s]+).*?status=(\d+).*?duration=(\d+(?:\.\d+)?)").unwrap()
         })
     }
 
@@ -107,7 +117,7 @@ impl RailsLogParser {
             // Matches Rails 6/7 SQL logs, including Rails 7 query comments:
             // User Load (0.5ms)  SELECT "users".* FROM "users" /*application='Blog'*/
             // Allow for optional query comments at the end
-            Regex::new(r"([\w\s]+)\s*\((\d+(?:\.\d+)?)ms\)\s+(SELECT|INSERT|UPDATE|DELETE)(?:.+?)(?:/\*.*?\*/)?$")
+            Regex::new(r"([\w\s]+)\s*\((\d+(?:\.\d+)?)ms\)\s+(SELECT|INSERT|UPDATE|DELETE).+?(?:/\*.*?\*/)?$")
                 .unwrap()
         })
     }
@@ -129,6 +139,26 @@ impl RailsLogParser {
             return Some(LogEvent::RailsStartupError(rails_error));
         }
 
+        // Check for Lograge single-line format FIRST (has status + duration)
+        // This takes priority because it's a complete request in one line
+        if let Some(caps) = Self::lograge_pattern().captures(clean_line) {
+            let method = caps[1].to_string();
+            let path = caps[2].to_string();
+            let status: u16 = caps[3].parse().unwrap_or(0);
+            let duration: f64 = caps[4].parse().unwrap_or(0.0);
+
+            // For Lograge, we create a complete request immediately
+            // First emit a "start" event
+            return Some(LogEvent::HttpRequest(HttpRequest {
+                method: method.clone(),
+                path: path.clone(),
+                status: Some(status),
+                duration: Some(duration),
+                controller: None,
+                action: None,
+            }));
+        }
+
         // Check for HTTP request start (traditional format)
         if let Some(caps) = Self::http_start_pattern().captures(clean_line) {
             // Handle both quoted and unquoted path formats
@@ -146,6 +176,7 @@ impl RailsLogParser {
         }
 
         // Check for HTTP request start (key-value format: method=POST path=/users)
+        // Only if it doesn't have status/duration (otherwise Lograge would catch it)
         if let Some(caps) = Self::http_start_keyvalue_pattern().captures(clean_line) {
             let method = caps[1].to_string();
             let path = caps[2].to_string();

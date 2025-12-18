@@ -34,11 +34,17 @@ impl RequestContextTracker {
     pub fn process_log_event(&self, event: &LogEvent) {
         match event {
             LogEvent::HttpRequest(req) => {
-                if req.status.is_none() {
-                    // Request started
+                // Check if this is a Lograge single-line format (has status AND path)
+                if req.status.is_some() && !req.path.is_empty() {
+                    // Lograge format: complete request in one line
+                    // Start and immediately complete
+                    self.start_request(req);
+                    self.complete_request(req);
+                } else if req.status.is_none() {
+                    // Traditional format: Request started
                     self.start_request(req);
                 } else {
-                    // Request completed
+                    // Traditional format: Request completed (has status but no path)
                     self.complete_request(req);
                 }
             }
