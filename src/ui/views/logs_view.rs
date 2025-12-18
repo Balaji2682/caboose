@@ -20,6 +20,7 @@ pub fn render(
     _search_mode: bool,
     search_query: &str,
     log_scroll: usize,
+    horizontal_scroll: usize,
     auto_scroll: bool,
     filter_process: &Option<String>,
     spinner_frame: usize,
@@ -42,6 +43,7 @@ pub fn render(
         chunks[1],
         logs,
         log_scroll,
+        horizontal_scroll,
         auto_scroll,
         search_query,
         filter_process,
@@ -115,6 +117,7 @@ fn render_logs(
     area: ratatui::layout::Rect,
     logs: &[LogLine],
     log_scroll: usize,
+    horizontal_scroll: usize,
     auto_scroll: bool,
     search_query: &str,
     filter_process: &Option<String>,
@@ -155,11 +158,20 @@ fn render_logs(
         log_scroll.min(total_logs.saturating_sub(visible_height))
     };
 
+    let h_scroll = horizontal_scroll; // Capture for use in closure
     let log_lines: Vec<Line> = filtered
         .iter()
         .skip(start_idx)
         .take(visible_height.max(1))
         .map(|log| {
+            // Apply horizontal scrolling to the content
+            let scrolled_content = if h_scroll > 0 && log.content.len() > h_scroll {
+                &log.content[h_scroll..]
+            } else if h_scroll > 0 {
+                "" // Scrolled past the content
+            } else {
+                &log.content
+            };
             // Check for Rails-specific errors first for prominent highlighting
             let is_rails_error = log.content.to_lowercase().contains("pending migration")
                 || (log.content.to_lowercase().contains("database")
@@ -196,12 +208,22 @@ fn render_logs(
                 Style::default()
             };
 
+            // Add process icon based on name
+            let process_icon = match log.process_name.as_str() {
+                "web" | "rails" => "🌐",
+                "angular" | "frontend" | "ui" => "⚡",
+                "worker" | "sidekiq" => "⚙️",
+                _ => "▪",
+            };
+
             Line::from(vec![
                 Span::styled(
-                    format!("[{:8}] ", log.process_name),
+                    format!("[{}] ", log.process_name),
                     Style::default().fg(process_name_color(&log.process_name)),
                 ),
-                Span::styled(&log.content, content_style),
+                Span::raw(process_icon),
+                Span::raw(" "),
+                Span::styled(scrolled_content, content_style),
             ])
         })
         .collect();

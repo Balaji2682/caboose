@@ -127,6 +127,7 @@ pub struct App {
     search_mode: bool,
     search_query: String,
     log_scroll: usize,
+    horizontal_scroll: usize,
     auto_scroll: bool,
     _request_scroll: usize,
     selected_request: usize,
@@ -183,6 +184,7 @@ impl App {
             search_mode: false,
             search_query: String::new(),
             log_scroll: 0,
+            horizontal_scroll: 0,
             auto_scroll: true,
             _request_scroll: 0,
             selected_request: 0,
@@ -456,8 +458,20 @@ impl App {
         let total_logs = self.filtered_logs().len();
         if total_logs > 0 && self.log_scroll + 10 >= total_logs {
             self.auto_scroll = true;
-            self.log_scroll = 0;
+            // Don't reset scroll position - let auto-scroll handle it
         }
+    }
+
+    pub fn scroll_left(&mut self) {
+        self.horizontal_scroll = self.horizontal_scroll.saturating_sub(10);
+    }
+
+    pub fn scroll_right(&mut self) {
+        self.horizontal_scroll += 10;
+    }
+
+    pub fn scroll_home(&mut self) {
+        self.horizontal_scroll = 0;
     }
 
     pub fn scroll_page_up(&mut self, page_size: usize) {
@@ -473,7 +487,7 @@ impl App {
         let total_logs = self.filtered_logs().len();
         if total_logs > 0 && self.log_scroll + 10 >= total_logs {
             self.auto_scroll = true;
-            self.log_scroll = 0;
+            // Don't reset scroll position - let auto-scroll handle it
         }
     }
 
@@ -724,6 +738,7 @@ fn render_ui(f: &mut ratatui::Frame, app: &App) {
                 app.search_mode,
                 &app.search_query,
                 app.log_scroll,
+                app.horizontal_scroll,
                 app.auto_scroll,
                 &app.filter_process,
                 app.spinner_frame,
@@ -871,9 +886,14 @@ fn render_header(
         .split(area);
 
     // Render Block around header content
+    // Get username from environment or use "caboose" as fallback
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "caboose".to_string());
+
     let header_block = Block::default()
         .title(Span::styled(
-            " Caboose ",
+            format!(" {} ", username),
             Style::default()
                 .fg(Theme::apply_fade_to_color(
                     Theme::primary(),
@@ -1095,15 +1115,28 @@ fn render_footer(
         let mut footer = FooterBuilder::new()
             .add_binding("q", "Quit")
             .add_binding(":", "Command")
-            .add_binding("t/T", "Tab ←→")
-            .add_binding("/", "Search")
-            .add_binding("↑↓", "Scroll");
+            .add_binding("t/T", "Tab ←→");
 
-        // Show auto-scroll status if disabled
-        if !app.auto_scroll && matches!(app.view_mode, ViewMode::Logs) {
-            footer = footer.add_binding("End", "⚠️ Auto-scroll OFF");
+        // Add view-specific bindings
+        if matches!(app.view_mode, ViewMode::Logs) {
+            footer = footer
+                .add_binding("/", "Search")
+                .add_binding("↑↓", "V-Scroll")
+                .add_binding("←→", "H-Scroll");
+
+            // Show auto-scroll or Home hint
+            if !app.auto_scroll {
+                footer = footer.add_binding("End", "⚠️ Auto-scroll OFF");
+            } else if app.horizontal_scroll > 0 {
+                footer = footer.add_binding("Home", "Reset H-Scroll");
+            } else {
+                footer = footer.add_binding("c", "Clear");
+            }
         } else {
-            footer = footer.add_binding("c", "Clear");
+            footer = footer
+                .add_binding("/", "Search")
+                .add_binding("↑↓", "Scroll")
+                .add_binding("c", "Clear");
         }
 
         footer.build()
@@ -1225,6 +1258,21 @@ fn handle_key_event(app: &mut App, key: KeyEvent) {
             ViewMode::Exceptions => app.select_next_exception(),
             _ => {}
         },
+        KeyCode::Left => {
+            if matches!(app.view_mode, ViewMode::Logs) {
+                app.scroll_left();
+            }
+        }
+        KeyCode::Right => {
+            if matches!(app.view_mode, ViewMode::Logs) {
+                app.scroll_right();
+            }
+        }
+        KeyCode::Home => {
+            if matches!(app.view_mode, ViewMode::Logs) {
+                app.scroll_home();
+            }
+        }
         KeyCode::PageUp => {
             if matches!(app.view_mode, ViewMode::Logs) {
                 app.scroll_page_up(10);

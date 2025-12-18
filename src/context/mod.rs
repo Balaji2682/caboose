@@ -37,9 +37,11 @@ impl RequestContextTracker {
                 // Check if this is a Lograge single-line format (has status AND path)
                 if req.status.is_some() && !req.path.is_empty() {
                     // Lograge format: complete request in one line
-                    // Start and immediately complete
-                    self.start_request(req);
+                    // BUT: Complete any existing request first (to capture its queries)
                     self.complete_request(req);
+
+                    // Then start this new request (keeps it active to collect queries)
+                    self.start_request(req);
                 } else if req.status.is_none() {
                     // Traditional format: Request started
                     self.start_request(req);
